@@ -1,0 +1,14 @@
+{
+  "name": "deepseek-desktop-pet",
+  "version": "1.0.0",
+  "description": "可爱的 DeepSeek 桌宠：一键启动 DeepSeek 网页版 / dsh，还能当垃圾桶吃掉文件",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^34.2.0"
+  }
+}

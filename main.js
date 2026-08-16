@@ -1,0 +1,739 @@
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen, dialog, clipboard } = require('electron');
+const { spawn, execFile } = require('child_process');
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+
+// ---------- 诊断日志 ----------
+const LOG_FILE = path.join(__dirname, 'pet-log.txt');
+function log(msg) {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+  try { fs.appendFileSync(LOG_FILE, line, 'utf8'); } catch (_) {}
+  try { console.log('[pet]', msg); } catch (_) {}
+}
+log(`===== 启动 app dir = ${__dirname} =====`);
+
+// 宠物立绘：启动时读成 data URL，避免 file:// 图片被 CSP 拦截 / 画布跨域污染
+let petImageDataUrl = null;
+try {
+  const buf = fs.readFileSync(path.join(__dirname, 'assets', 'pet.jpg'));
+  petImageDataUrl = 'data:image/jpeg;base64,' + buf.toString('base64');
+  log(`pet.jpg 读取成功: ${buf.length} 字节 -> dataUrl ${petImageDataUrl.length} 字符`);
+} catch (err) {
+  log('pet.jpg 读取失败: ' + (err && err.stack ? err.stack : err));
+  console.error('读取宠物图片失败:', err);
+}
+
+// ---------- 配置（皮肤 / 开机自启） ----------
+const CONFIG_FILE = path.join(__dirname, 'pet-config.json');
+const SKINS_DIR = path.join(__dirname, 'skins');
+const AUTOSTART_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+const AUTOSTART_NAME = 'DeepSeekPet';
+
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (_) { return {}; }
+}
+function saveConfig(cfg) {
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf8'); } catch (e) { log('保存配置失败: ' + e); }
+}
+const config = loadConfig();
+
+// ---------- 网站快捷入口（一级常用 / 二级更多，可自定义） ----------
+const DEFAULT_SITES = {
+  frequent: [
+    { name: 'ChatGPT', url: 'https://chatgpt.com' },
+    { name: '哔哩哔哩', url: 'https://www.bilibili.com' },
+    { name: 'GitHub', url: 'https://github.com' },
+    { name: '知乎', url: 'https://www.zhihu.com' },
+  ],
+  more: [
+    { name: 'YouTube', url: 'https://www.youtube.com' },
+    { name: '百度', url: 'https://www.baidu.com' },
+    { name: '抖音', url: 'https://www.douyin.com' },
+    { name: '微博', url: 'https://weibo.com' },
+  ],
+};
+
+// 归一化网站列表：只保留 {name, url} 且 url 必须是 http(s)
+function normalizeSites(raw) {
+  const clean = (list) => Array.isArray(list)
+    ? list
+        .map((s) => (s && typeof s === 'object' ? { name: String(s.name || '').trim(), url: String(s.url || '').trim() } : null))
+        .filter((s) => s && s.name && /^https?:\/\//i.test(s.url))
+    : [];
+  const out = { frequent: clean(raw && raw.frequent), more: clean(raw && raw.more) };
+  if (!out.frequent.length && !out.more.length) return JSON.parse(JSON.stringify(DEFAULT_SITES));
+  return out;
+}
+if (!config.sites) config.sites = DEFAULT_SITES;
+config.sites = normalizeSites(config.sites);
+
+// ---------- 开机自启（注册表 HKCU\...\Run） ----------
+function regRun(args) {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn('reg.exe', args, { stdio: 'ignore', windowsHide: true });
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0));
+    } catch (_) { resolve(false); }
+  });
+}
+
+function getAutoStart() {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn('reg.exe', ['query', AUTOSTART_KEY, '/v', AUTOSTART_NAME], { windowsHide: true });
+      let out = '';
+      child.stdout.on('data', (d) => { out += String(d); });
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0 && out.includes(AUTOSTART_NAME)));
+    } catch (_) { resolve(false); }
+  });
+}
+
+async function setAutoStart(enable) {
+  if (enable) {
+    const value = `"${process.execPath}" "${path.resolve(__dirname)}"`;
+    await regRun(['add', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', value, '/f']);
+  } else {
+    await regRun(['delete', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/f']);
+  }
+  return getAutoStart();
+}
+
+// ---------- 皮肤（导入的 PNG 立绘） ----------
+function getImportedSkins() {
+  const list = [];
+  try {
+    if (!fs.existsSync(SKINS_DIR)) return list;
+    for (const f of fs.readdirSync(SKINS_DIR)) {
+      if (!/\.(png|jpe?g|webp|gif)$/i.test(f)) continue;
+      try {
+        const buf = fs.readFileSync(path.join(SKINS_DIR, f));
+        const ext = path.extname(f).toLowerCase();
+        const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+        // 布局描述（多行动画/镜像/每套帧时长）：<皮肤名>.layout.json
+        let layout = null;
+        try {
+          const lp = path.join(SKINS_DIR, f.replace(/\.[^.]+$/, '') + '.layout.json');
+          layout = JSON.parse(fs.readFileSync(lp, 'utf8'));
+        } catch (_) {}
+        list.push({
+          id: 'imported:' + f,
+          name: f.replace(/\.[^.]+$/, ''),
+          dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64'),
+          layout,
+        });
+      } catch (e) { log('读取皮肤失败 ' + f + ': ' + e); }
+    }
+  } catch (e) { log('扫描皮肤目录失败: ' + e); }
+  return list;
+}
+
+const PET_W = 560; // 加宽：左侧是宠物，右侧留出菜单区（透明区点击穿透）
+const PET_H = 330;
+
+let win = null;
+let tray = null;
+let isQuitting = false;
+let topmostOn = true; // 置顶开关状态（主进程镜像，托盘显示用）
+let topmostWatcher = null; // 置顶守护子进程（置顶关期间每秒把宠物贴回壁纸层之上）
+let watcherRestarts = 0; // 守护连续异常退出计数（自动重启保护）
+
+// Window-drag state (cursor-follow based, all coordinates from screen API for consistency)
+let drag = null;
+
+function isPortListening(port, host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port, host });
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch (_) {}
+      resolve(v);
+    };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(600, () => finish(false));
+  });
+}
+
+async function launchDsh() {
+  // 智能启动：dsh 的网页服务如果已经在 127.0.0.1:3080 运行，就直接打开它，
+  // 否则新开一个控制台窗口运行 `dsh web`
+  const port = 3080;
+  if (await isPortListening(port)) {
+    shell.openExternal(`http://127.0.0.1:${port}/`);
+    return 'opened';
+  }
+  // start 的第一个参数 "" 是窗口标题占位，避免被当成命令
+  const child = spawn(
+    'cmd.exe',
+    ['/c', 'start', '', 'cmd.exe', '/k', 'dsh', 'web'],
+    { detached: true, stdio: 'ignore', windowsHide: false, shell: false }
+  );
+  child.unref();
+  return 'launched';
+}
+
+function openDeepseek() {
+  shell.openExternal('https://chat.deepseek.com/');
+}
+
+// 置顶原生兜底（Windows）：Electron 34 的 bug（#45024）——focusable:false 的窗口
+// setAlwaysOnTop(false) 要等窗口被点击激活才生效，而本窗口永不激活，导致置顶关不掉。
+// 用 user32 SetWindowPos 直接改原生窗口样式（不抢键盘焦点、不改变位置尺寸）：
+//   开 → HWND_TOPMOST（悬浮在所有窗口之上）
+//   关 → HWND_BOTTOM（先落到底部；随后由置顶守护进程每秒贴回壁纸层之上）
+// 历史：WorkerW 挂靠方案在用户机器执行失败（14:44 三次 native=false，动态壁纸 Wallpaper
+//      Engine 接管了桌面窗口结构）；HWND_BOTTOM 方案实测可见（13:32/13:36/13:45）。
+function setTopmostNative(enable) {
+  return new Promise((resolve) => {
+    try {
+      const handle = win.getNativeWindowHandle();
+      const hwnd = handle.length >= 8 ? handle.readBigUInt64LE(0).toString() : handle.readUInt32LE(0).toString();
+      const ps = [
+        '$h=[IntPtr]::new([Int64]' + hwnd + ')',
+        '$after=[IntPtr]::new([Int64]' + (enable ? '-1' : '1') + ')',
+        '$sig=\'[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags); [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd); [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder s, int n); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);\'',
+        '$tp=Add-Type -MemberDefinition $sig -Name WinPos -Namespace NP -PassThru',
+        // 19 = SWP_NOSIZE(1) | SWP_NOMOVE(2) | SWP_NOACTIVATE(16)
+        '$ok=$tp::SetWindowPos($h,$after,0,0,0,0,19)',
+      ];
+      if (!enable) {
+        // 诊断：打印 z 序底部 6 个窗口的类名与进程，便于排查壁纸层结构
+        ps.push(
+          '$w=$tp::GetWindow([IntPtr]::Zero,1)',
+          '$sb=New-Object System.Text.StringBuilder 256',
+          'for($i=0;$i -lt 6 -and $w -ne [IntPtr]::Zero;$i++){',
+          '  $null=$sb.Clear()',
+          '  $null=$tp::GetClassName($w,$sb,256)',
+          '  $p=[uint32]0',
+          '  $null=$tp::GetWindowThreadProcessId($w,[ref]$p)',
+          '  $pn=""',
+          '  if($p -ne 0){ $pr=Get-Process -Id $p -ErrorAction SilentlyContinue; if($pr){$pn=$pr.ProcessName} }',
+          '  "z$i cls=" + $sb.ToString() + " proc=" + $pn',
+          '  $w=$tp::GetWindow($w,3)',
+          '}',
+        );
+      }
+      ps.push('if($ok){exit 0}else{exit 1}');
+      const script = ps.join('; ');
+      // 不设 stdio:'ignore'：捕获 stdout/stderr，失败或诊断信息写进日志
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 15000 }, (err, _stdout, stderr) => {
+        if (err) {
+          const detail = stderr ? ' stderr=' + String(stderr).trim().slice(0, 200) : '';
+          log('原生置顶调用失败:' + detail + ' | ' + ((err && err.message) || err));
+        } else if (!enable && _stdout) {
+          const diag = String(_stdout).trim().split('\n').slice(0, 6).map((s) => s.trim()).join(' | ');
+          if (diag) log('置顶关 z序诊断: ' + diag);
+        }
+        resolve(!err);
+      });
+    } catch (e) {
+      log('原生置顶异常: ' + e);
+      resolve(false);
+    }
+  });
+}
+
+// ---------- 置顶守护（Windows）----------
+// Wallpaper Engine 会在窗口关闭/场景切换时重排 z 序，把壁纸层窗口插到宠物之上 → 宠物被盖住。
+// 守护进程每秒把宠物重新贴到「壁纸层窗口之后」：壁纸之上、所有应用窗口之下。
+// 壁纸层识别：窗口类 Progman/WorkerW，或进程名 wallpaper*（WE 渲染进程 wallpaper64/32）。
+function killTopmostWatcher() {
+  if (topmostWatcher) {
+    try { topmostWatcher.kill(); } catch (_) {}
+    topmostWatcher = null;
+  }
+}
+
+function startTopmostWatcher() {
+  killTopmostWatcher();
+  if (!win || process.platform !== 'win32') return;
+  try {
+    const handle = win.getNativeWindowHandle();
+    const hwnd = handle.length >= 8 ? handle.readBigUInt64LE(0).toString() : handle.readUInt32LE(0).toString();
+    const script = [
+      "$sig=@'",
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public class PetWatch {',
+      '  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int X, int Y, int cx, int cy, uint f);',
+      '  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);',
+      '  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);',
+      '  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);',
+      '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+      '}',
+      "'@",
+      '$null = Add-Type -TypeDefinition $sig',
+      '$pet = [IntPtr]::new([Int64]$args[0])',
+      '$sb = New-Object System.Text.StringBuilder 256',
+      'while ([PetWatch]::IsWindow($pet)) {',
+      '  $cur = [PetWatch]::GetWindow([IntPtr]::Zero, 1)',
+      '  $lastDesktop = [IntPtr]::Zero',
+      '  while ($cur -ne [IntPtr]::Zero) {',
+      '    if ($cur -eq $pet) { $cur = [PetWatch]::GetWindow($cur, 3); continue }',
+      '    $null = $sb.Clear()',
+      '    $null = [PetWatch]::GetClassName($cur, $sb, 256)',
+      '    $cls = $sb.ToString()',
+      '    $p = [uint32]0',
+      '    $null = [PetWatch]::GetWindowThreadProcessId($cur, [ref]$p)',
+      '    $pn = ""',
+      '    if ($p -ne 0) { $pr = Get-Process -Id $p -ErrorAction SilentlyContinue; if ($pr) { $pn = $pr.ProcessName } }',
+      '    if ($cls -eq "Progman" -or $cls -eq "WorkerW" -or $pn -like "wallpaper*") {',
+      '      $lastDesktop = $cur',
+      '      $cur = [PetWatch]::GetWindow($cur, 3)',
+      '      continue',
+      '    }',
+      '    break',
+      '  }',
+      '  if ($lastDesktop -ne [IntPtr]::Zero) {',
+      '    $null = [PetWatch]::SetWindowPos($pet, $lastDesktop, 0, 0, 0, 0, 19)',
+      '  } else {',
+      '    $null = [PetWatch]::SetWindowPos($pet, [IntPtr]::new([Int64]1), 0, 0, 0, 0, 19)',
+      '  }',
+      '  Start-Sleep -Seconds 1',
+      '}',
+    ].join('\n');
+    topmostWatcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script, hwnd], { detached: true, stdio: 'ignore', windowsHide: true });
+    const child = topmostWatcher;
+    topmostWatcher.on('exit', () => {
+      topmostWatcher = null;
+      // 守护意外退出（被杀软误杀/崩溃等）：置顶仍为关时 3 秒后自动重启，最多连续 3 次
+      if (!topmostOn && !isQuitting && win) {
+        if (watcherRestarts >= 3) {
+          log('置顶守护连续退出超过3次，停止自动重启（重新切换置顶可恢复）');
+          return;
+        }
+        watcherRestarts++;
+        log('置顶守护意外退出，3秒后自动重启（第' + watcherRestarts + '次）');
+        setTimeout(() => {
+          if (!topmostOn && !isQuitting && win) startTopmostWatcher();
+        }, 3000);
+      }
+    });
+    topmostWatcher.on('error', () => { topmostWatcher = null; });
+    topmostWatcher.unref();
+    // 存活超过 5 秒视为健康，清零连续退出计数
+    setTimeout(() => { if (topmostWatcher === child) watcherRestarts = 0; }, 5000);
+    log('置顶守护启动（每秒贴回壁纸层之上）');
+  } catch (e) {
+    log('置顶守护启动失败: ' + e);
+  }
+}
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: PET_W,
+    height: PET_H,
+    transparent: true,
+    frame: false,
+    resizable: false,
+    hasShadow: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: false, // 永不夺取键盘焦点，回车/按键始终属于用户当前应用
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  });
+
+  win.setAlwaysOnTop(true, 'floating');
+  // 关闭后台节流：被菜单捕获层盖住时，宠物动画照常播放
+  win.webContents.setBackgroundThrottling(false);
+  win.loadFile('index.html');
+
+  // 收集渲染进程的报错信息到日志
+  win.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    log(`[renderer console ${level}] ${message} (${sourceId}:${line})`);
+  });
+  win.webContents.on('preload-error', (_e, p, error) => {
+    log(`[preload-error] ${p}: ${error}`);
+  });
+  win.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    log(`[did-fail-load] ${code} ${desc} ${url}`);
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    log(`[render-process-gone] ${JSON.stringify(details)}`);
+  });
+
+  const { workArea } = screen.getPrimaryDisplay();
+  win.setPosition(
+    workArea.x + workArea.width - PET_W - 60,
+    workArea.y + workArea.height - PET_H - 40
+  );
+
+  win.on('close', (e) => {
+    if (!isQuitting) {
+      // 关闭窗口时隐藏到托盘而不是退出
+      e.preventDefault();
+      win.hide();
+    }
+  });
+  win.on('blur', () => onMenuWindowBlur());
+  win.on('closed', () => {
+    win = null;
+    if (!isQuitting) {
+      // 窗口被意外销毁（如 explorer 重启等极端情况）：自动重建，回到置顶悬浮
+      log('窗口意外销毁，自动重建');
+      topmostOn = true;
+      createWindow();
+    }
+  });
+}
+
+// 显示宠物：先 restore（Win+D 会把窗口最小化，show() 无法解除，必须 restore）
+// 置顶开启时抬到最前；置顶关闭（桌面层）时保持原层级，不抬升
+function showPet() {
+  if (!win) return;
+  if (win.isMinimized()) win.restore();
+  win.show();
+  if (topmostOn) win.moveTop();
+}
+
+// ---------- 音乐控制（媒体键模拟）----------
+// VK_MEDIA_PLAY_PAUSE=0xB3 / VK_MEDIA_NEXT_TRACK=0xB0 / VK_MEDIA_PREV_TRACK=0xB1
+// 系统会把媒体键路由到当前媒体会话，Spotify/网易云/QQ音乐/foobar 等播放器普遍响应。
+function sendMediaKey(vk) {
+  return new Promise((resolve) => {
+    try {
+      const hex = vk.toString(16);
+      const ps = [
+        '$sig=\'[DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);\'',
+        '$t=Add-Type -MemberDefinition $sig -Name MK -Namespace NM -PassThru',
+        '$t::keybd_event(0x' + hex + ',0,0,[UIntPtr]::Zero)',
+        '$t::keybd_event(0x' + hex + ',0,2,[UIntPtr]::Zero)',
+        'exit 0',
+      ].join('; ');
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { windowsHide: true, timeout: 10000 }, (err) => resolve(!err));
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
+ipcMain.handle('media-control', async (_e, action) => {
+  const keys = { 'play-pause': 0xB3, 'next': 0xB0, 'prev': 0xB1 };
+  const vk = keys[action];
+  if (!vk) return false;
+  const ok = await sendMediaKey(vk);
+  log('音乐控制 -> ' + action + ' (ok=' + ok + ')');
+  return ok;
+});
+
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: '显示桌宠', click: showPet },
+    { type: 'separator' },
+    { label: '🌐 打开 DeepSeek 网页版', click: () => openDeepseek() },
+    { label: '🤖 启动 dsh', click: () => { launchDsh(); } },
+    { type: 'separator' },
+    { label: '🎵 播放/暂停', click: () => { sendMediaKey(0xB3); } },
+    { label: '⏮ 上一首', click: () => { sendMediaKey(0xB1); } },
+    { label: '⏭ 下一首', click: () => { sendMediaKey(0xB0); } },
+    { type: 'separator' },
+    {
+      label: '📌 置顶', type: 'checkbox', checked: topmostOn,
+      click: async (item) => {
+        await setTopmostFromMain(!!item.checked);
+        if (tray) tray.setContextMenu(buildTrayMenu());
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '🚀 开机自启', type: 'checkbox', checked: !!config.autoStart,
+      click: async (item) => {
+        const ok = await setAutoStart(!!item.checked);
+        config.autoStart = ok;
+        saveConfig(config);
+        if (tray) tray.setContextMenu(buildTrayMenu());
+        log('开机自启 -> ' + (ok ? '开' : '关'));
+      },
+    },
+    { type: 'separator' },
+    { label: '退出', click: () => { isQuitting = true; app.quit(); } },
+  ]);
+}
+
+function createTray() {
+  const icon = nativeImage
+    .createFromPath(path.join(__dirname, 'assets', 'pet.jpg'))
+    .resize({ width: 32, height: 32 });
+  tray = new Tray(icon);
+  tray.setToolTip('DeepSeek 桌宠 · 小深');
+  tray.setContextMenu(buildTrayMenu());
+  tray.on('click', showPet);
+}
+
+// ---------- IPC ----------
+ipcMain.on('log', (_e, msg) => log('[renderer] ' + msg));
+
+ipcMain.handle('get-pet-image', () => petImageDataUrl);
+
+ipcMain.handle('get-config', () => config);
+
+ipcMain.handle('get-bounds', () => desktopBounds);
+
+ipcMain.handle('set-skin', (_e, skinId) => {
+  config.skin = String(skinId);
+  saveConfig(config);
+  log('皮肤切换 -> ' + config.skin);
+  return true;
+});
+
+ipcMain.handle('get-skins', () => ({
+  base: petImageDataUrl,
+  imported: getImportedSkins(),
+  current: config.skin || 'classic',
+}));
+
+ipcMain.handle('set-auto-start', async (_e, enable) => {
+  const ok = await setAutoStart(!!enable);
+  config.autoStart = ok;
+  saveConfig(config);
+  if (tray) tray.setContextMenu(buildTrayMenu());
+  log('开机自启 -> ' + (ok ? '开' : '关'));
+  return ok;
+});
+
+ipcMain.handle('import-skin', async () => {
+  const res = await dialog.showOpenDialog(win, {
+    title: '选择立绘图片（PNG 透明图效果最佳）',
+    filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
+    properties: ['openFile'],
+  });
+  if (res.canceled || !res.filePaths || !res.filePaths.length) return null;
+  const src = res.filePaths[0];
+  try {
+    if (!fs.existsSync(SKINS_DIR)) fs.mkdirSync(SKINS_DIR, { recursive: true });
+    const name = path.basename(src);
+    fs.copyFileSync(src, path.join(SKINS_DIR, name));
+    const buf = fs.readFileSync(path.join(SKINS_DIR, name));
+    const ext = path.extname(name).toLowerCase();
+    const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
+    const skin = { id: 'imported:' + name, name: name.replace(/\.[^.]+$/, ''), dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64') };
+    log('导入皮肤成功: ' + name);
+    return skin;
+  } catch (e) {
+    log('导入皮肤失败: ' + e);
+    return null;
+  }
+});
+
+ipcMain.handle('open-deepseek', () => { openDeepseek(); return true; });
+
+// 打开任意网页（右键菜单快捷入口），只放行 http/https
+ipcMain.handle('open-web', (_e, url) => {
+  const u = String(url || '').trim();
+  if (!/^https?:\/\//i.test(u)) return false;
+  try { shell.openExternal(u); return true; } catch (e) { log('打开网页失败: ' + u + ' -> ' + e); return false; }
+});
+
+// 网站列表读写（一级常用 / 二级更多）
+ipcMain.handle('get-sites', () => config.sites);
+
+ipcMain.handle('set-sites', (_e, sites) => {
+  config.sites = normalizeSites(sites);
+  saveConfig(config);
+  log('网站列表已更新: frequent=' + config.sites.frequent.length + ' more=' + config.sites.more.length);
+  return config.sites;
+});
+
+ipcMain.handle('launch-dsh', async () => launchDsh());
+
+ipcMain.handle('trash-items', async (_e, paths) => {
+  const results = [];
+  for (const p of paths || []) {
+    try {
+      await shell.trashItem(p);
+      results.push({ ok: true, path: p });
+    } catch (err) {
+      results.push({ ok: false, path: p, error: String((err && err.message) || err) });
+    }
+  }
+  return results;
+});
+
+// 拖动：渲染进程发「相对起点的 client 位移」+ 主进程按起点窗口位置累加，
+// client 坐标是 CSS 像素（DIP），与 getPosition 同一坐标系，彻底避免 DPI 漂移
+let dragMoveCount = 0;
+ipcMain.on('drag-start', () => {
+  if (!win) return;
+  // 拖动前先把窗口尺寸钉回标准值（防御：某种原因曾把它放大）
+  win.setSize(PET_W, PET_H);
+  const [wx, wy] = win.getPosition();
+  drag = { wx, wy };
+  dragMoveCount = 0;
+  // 诊断：区分“窗口真的变大”还是“页面被缩放”（innerWidth 变大但窗口尺寸不变）
+  let zoom = '?';
+  try { zoom = String(win.webContents.getZoomFactor()); } catch (_) {}
+  log('[drag] start win=(' + wx + ',' + wy + ') size=' + JSON.stringify(win.getSize()) + ' zoom=' + zoom);
+});
+
+ipcMain.on('drag-move', (_e, p) => {
+  if (!win || !drag || !p || p.dx == null || p.dy == null) return;
+  // 拖动边界按“身体可见范围”计算：窗口有透明空边（上约60px、下约44px），
+  // 允许窗口略微越出屏幕，让宠物身体能真正贴到屏幕最顶端/最底端
+  const ny = clampNum(
+    Math.round(drag.wy + p.dy),
+    desktopBounds.y - 60,
+    Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44)
+  );
+  const nx = clampNum(Math.round(drag.wx + p.dx), desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
+  // setBounds 同时锁定位置与尺寸：无论什么原因导致的窗口变大都会被立即纠正
+  win.setBounds({ x: nx, y: ny, width: PET_W, height: PET_H });
+  if (++dragMoveCount % 15 === 0) {
+    log('[drag] move dx=' + Math.round(p.dx) + ' dy=' + Math.round(p.dy) + ' -> win=(' + nx + ',' + ny + ')');
+  }
+});
+
+ipcMain.on('drag-end', () => { drag = null; });
+
+// 菜单（窗口内菜单方案）：打开菜单时窗口临时可聚焦，点菜单外任意处 → 窗口失焦 → 关闭菜单。
+// 没有全屏覆盖窗口，浏览器永远不会被遮挡，网页视频不会暂停
+let menuOpenInMain = false;
+
+ipcMain.on('menu-opened', () => {
+  menuOpenInMain = true;
+  if (!win) return;
+  win.setFocusable(true);  // 临时可聚焦，让“点外面”能触发失焦
+  win.focus();
+  log('菜单打开（窗口已临时可聚焦）');
+});
+
+ipcMain.on('menu-closed', () => {
+  if (menuOpenInMain) log('菜单关闭');
+  menuOpenInMain = false;
+  if (win) win.setFocusable(false); // 恢复“永不抢焦点”
+});
+
+// 菜单打开期间窗口失焦 = 点了菜单外 → 通知宠物关闭菜单
+function onMenuWindowBlur() {
+  if (menuOpenInMain && win) {
+    log('窗口失焦，关闭菜单');
+    menuOpenInMain = false;
+    win.setFocusable(false);
+    win.webContents.send('menu-dismiss');
+  }
+}
+
+// 打开剪贴板路径：文件夹直接打开，文件在资源管理器中定位，网址用浏览器打开
+ipcMain.handle('open-clipboard-path', async () => {
+  const text = (clipboard.readText() || '').trim();
+  if (!text) return 'empty';
+  let p = text.replace(/^["']|["']$/g, '');
+  if (/^https?:\/\//i.test(p)) {
+    shell.openExternal(p);
+    return 'url';
+  }
+  try {
+    const stats = await fs.promises.stat(p);
+    if (stats.isDirectory()) {
+      shell.openPath(p);
+      return 'folder';
+    }
+    shell.showItemInFolder(p);
+    return 'file';
+  } catch (e) {
+    log('打开剪贴板路径失败: ' + p + ' -> ' + e);
+    return 'invalid';
+  }
+});
+
+// 鼠标穿透：透明区域点击直达桌面，只有宠物身体/面板可点（forward 保持 mousemove 可达，以便恢复）
+ipcMain.on('set-mouse-ignore', (_e, flag) => {
+  if (win) win.setIgnoreMouseEvents(!!flag, { forward: true });
+});
+
+async function setTopmostFromMain(enable) {
+  if (!win) return false;
+  topmostOn = enable;
+  // 先走 Electron API（更新内部状态；mac/Linux 直接生效）
+  win.setAlwaysOnTop(enable, 'floating');
+  if (enable) win.moveTop(); // 开启时立即抬升，保证回到最前
+  // Windows 再用原生调用兜底（修复 #45024）：开→TOPMOST；关→落底桌面层（HWND_BOTTOM）
+  let nativeOk = true;
+  if (process.platform === 'win32') {
+    nativeOk = await setTopmostNative(enable);
+    if (enable) {
+      killTopmostWatcher(); // 悬浮模式不需要守护
+    } else {
+      startTopmostWatcher(); // 即使一次性调用失败，守护也能在1秒内把宠物贴回壁纸层
+    }
+  }
+  log('置顶开关 -> ' + (enable ? '开' : '关') + ' (native=' + nativeOk + ')');
+  return win.isAlwaysOnTop();
+}
+
+ipcMain.handle('set-topmost', (_e, flag) => setTopmostFromMain(!!flag));
+
+ipcMain.handle('get-topmost', () => topmostOn);
+
+ipcMain.on('quit', () => { isQuitting = true; app.quit(); });
+
+// ---------- App lifecycle ----------
+// 单实例锁：避免重复启动产生多只宠物互相干扰（拖动错乱、日志串扰）
+const clampNum = (v, a, b) => Math.max(a, Math.min(b, v));
+let desktopBounds = { x: 0, y: 0, right: 1920, bottom: 1080 };      // 工作区（不含任务栏）
+
+function computeDesktopBounds() {
+  try {
+    const ds = screen.getAllDisplays();
+    let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+    for (const d of ds) {
+      const b = d.workArea;
+      x1 = Math.min(x1, b.x);
+      y1 = Math.min(y1, b.y);
+      x2 = Math.max(x2, b.x + b.width);
+      y2 = Math.max(y2, b.y + b.height);
+    }
+    if (x1 !== Infinity) desktopBounds = { x: x1, y: y1, right: x2, bottom: y2 };
+    log('桌面边界: (' + desktopBounds.x + ',' + desktopBounds.y + ') ~ (' + desktopBounds.right + ',' + desktopBounds.bottom + ')');
+  } catch (e) {
+    log('computeDesktopBounds 失败: ' + e);
+  }
+}
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  log('检测到已有桌宠在运行，本实例退出');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    log('重复启动被拦截，聚焦现有桌宠窗口');
+    showPet();
+  });
+
+  app.whenReady().then(async () => {
+    log('app ready');
+    computeDesktopBounds();
+
+    // 开机自启：默认开启（首次运行自动写入启动项），之后每次启动保持同步
+    if (typeof config.autoStart !== 'boolean') {
+      config.autoStart = true;
+      saveConfig(config);
+    }
+    setAutoStart(config.autoStart).then((ok) => {
+      if (ok !== config.autoStart) {
+        config.autoStart = ok;
+        saveConfig(config);
+      }
+      log('开机自启状态: ' + (ok ? '开' : '关'));
+    });
+
+    createWindow();
+    createTray();
+  });
+
+  app.on('will-quit', () => { killTopmostWatcher(); });
+
+  app.on('window-all-closed', () => {
+    // Windows 下保持托盘常驻，除非显式退出
+  });
+}

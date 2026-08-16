@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>overlay</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; -webkit-user-select: none; }
+    html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+    #menu {
+      position: fixed;
+      display: none;
+      min-width: 200px;
+      max-height: 340px;
+      overflow-y: auto;
+      background: linear-gradient(180deg, #ffffff 0%, #f6faff 100%);
+      border: 1px solid rgba(59, 130, 246, 0.14);
+      border-radius: 16px;
+      box-shadow: 0 12px 32px rgba(30, 60, 130, 0.22), 0 2px 8px rgba(30, 60, 130, 0.10);
+      padding: 7px;
+      z-index: 99;
+      animation: menuIn 0.16s ease;
+    }
+    @keyframes menuIn {
+      from { opacity: 0; transform: scale(0.94) translateY(-4px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .menu-item {
+      padding: 9px 13px;
+      font-size: 13px;
+      color: #3d4a5c;
+      border-radius: 10px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.12s ease, color 0.12s ease, transform 0.06s ease;
+    }
+    .menu-item:hover {
+      background: #e3eeff;
+      color: #1d4ed8;
+      transform: translateX(2px);
+    }
+    .menu-item.danger { color: #e5484d; }
+    .menu-item.danger:hover { background: #ffecec; color: #c92a2a; }
+    .menu-sep {
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #d8e3f2, transparent);
+      margin: 5px 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="menu">
+    <div class="menu-item" data-action="deepseek">🌐 打开 DeepSeek 网页版</div>
+    <div class="menu-item" data-action="dsh">🤖 启动 dsh</div>
+    <div class="menu-item" data-action="clipboard">📋 打开剪贴板路径</div>
+    <div class="menu-sep"></div>
+    <div class="menu-item" data-action="media-play-pause">🎵 播放/暂停</div>
+    <div class="menu-item" data-action="media-prev">⏮ 上一首</div>
+    <div class="menu-item" data-action="media-next">⏭ 下一首</div>
+    <div class="menu-sep"></div>
+    <div class="menu-item" data-action="skin">🎨 换肤</div>
+    <div class="menu-item" data-action="autostart">🚀 开机自启：<b id="autostart-state">开</b></div>
+    <div class="menu-item" data-action="topmost">📌 置顶：<b id="topmost-state">开</b></div>
+    <div class="menu-item" data-action="dance">🎉 来点动作</div>
+    <div class="menu-item" data-action="about">ℹ️ 使用说明</div>
+    <div class="menu-sep"></div>
+    <div class="menu-item danger" data-action="quit">❌ 退出</div>
+  </div>
+  <script>
+    const menu = document.getElementById('menu');
+    let petBox = null; // { x, y, w, h } 宠物窗口屏幕范围（用于避让）
+
+    function place(x, y) {
+      const mw = menu.offsetWidth;
+      const mh = menu.offsetHeight;
+      const W = window.innerWidth, H = window.innerHeight;
+      const overlaps = (L, T) => !petBox ||
+        !(L + mw < petBox.x || L > petBox.x + petBox.w || T + mh < petBox.y || T > petBox.y + petBox.h);
+      let mx = Math.min(Math.max(x, 4), W - mw - 4);
+      let my = Math.min(Math.max(y, 4), H - mh - 4);
+      if (overlaps(mx, my)) {
+        // 右撇子：优先人物右侧，放不下再左侧
+        const candTop = Math.min(Math.max(y - mh / 2, 4), H - mh - 4);
+        const candRight = Math.min(Math.max(petBox.x + petBox.w + 10, 4), W - mw - 4);
+        const candLeft = Math.min(Math.max(petBox.x - mw - 10, 4), W - mw - 4);
+        if (!overlaps(candRight, candTop)) { mx = candRight; my = candTop; }
+        else if (!overlaps(candLeft, candTop)) { mx = candLeft; my = candTop; }
+      }
+      menu.style.left = Math.round(mx) + 'px';
+      menu.style.top = Math.round(my) + 'px';
+    }
+
+    ovAPI.onShowMenu((payload) => {
+      console.log('overlay 收到 show-menu');
+      petBox = payload.pet;
+      document.getElementById('autostart-state').textContent = payload.autoStart ? '开' : '关';
+      document.getElementById('topmost-state').textContent = payload.topmost ? '开' : '关';
+      menu.style.display = 'block';
+      place(payload.x, payload.y);
+    });
+
+    document.addEventListener('mousedown', (e) => {
+      const item = e.target.closest('.menu-item');
+      if (item) {
+        ovAPI.sendAction(item.dataset.action);
+      } else {
+        ovAPI.sendDismiss(); // 点菜单外任意处（含桌面/任务栏）关闭
+      }
+      menu.style.display = 'none';
+    });
+  </script>
+</body>
+</html>

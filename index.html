@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>DeepSeek 桌宠</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="stage">
+    <!-- 宠物本体 -->
+    <div id="pet-pos">
+      <div id="pet">
+        <img id="sprite" draggable="false" alt="pet" />
+        <canvas id="sprite-canvas" width="384" height="416"></canvas>
+        <div id="particles"></div>
+      </div>
+    </div>
+
+    <!-- 气泡（窗口级定位，JS 按宠物头顶位置放置并夹回窗口内） -->
+    <div id="bubble" class="hidden">
+      <span id="bubble-text"></span>
+    </div>
+
+    <!-- 地面阴影 -->
+    <div id="shadow"></div>
+
+    <!-- 右键菜单（窗口内，显示在人物左侧的透明区） -->
+    <div id="menu" class="hidden">
+      <div class="menu-label">🎵 音乐控制</div>
+      <div class="media-row">
+        <button class="mini-btn" data-action="media-prev" title="上一首">⏮</button>
+        <button class="mini-btn primary" data-action="media-play-pause" title="播放 / 暂停">⏯</button>
+        <button class="mini-btn" data-action="media-next" title="下一首">⏭</button>
+      </div>
+
+      <div class="menu-sep"></div>
+      <div class="menu-item" data-action="deepseek">🌐 打开 DeepSeek 网页版</div>
+      <div class="menu-item" data-action="dsh">🤖 启动 dsh</div>
+      <div class="menu-item" data-action="clipboard">📋 打开剪贴板路径</div>
+      <div class="menu-item" data-action="skin">🎨 换肤</div>
+      <div class="menu-item" data-action="autostart">🚀 开机自启：<b id="autostart-state">开</b></div>
+      <div class="menu-item" data-action="topmost">📌 置顶：<b id="topmost-state">开</b></div>
+      <div class="menu-item" data-action="dance">🎉 来点动作</div>
+      <div class="menu-item" data-action="about">ℹ️ 使用说明</div>
+
+      <div class="menu-sep"></div>
+      <div class="menu-label">🌐 快捷入口</div>
+      <div id="sites-grid" class="web-grid"></div>
+      <div class="menu-item" id="sites-more-toggle" data-action="sites-more">📂 更多网站<span class="more-count" id="sites-more-count"></span><span class="arrow">▾</span></div>
+      <div id="sites-more-box" class="sites-more-box hidden"></div>
+      <div class="menu-item" data-action="sites-manage">🔧 管理网站</div>
+
+      <div class="menu-sep"></div>
+      <div class="menu-item danger" data-action="quit">❌ 退出</div>
+    </div>
+
+    <!-- 换肤面板 -->
+    <div id="skins" class="hidden">
+      <div class="about-title">🎨 选择皮肤</div>
+      <div id="skin-list"></div>
+      <div class="skin-import" data-action="import-skin">📂 导入 PNG 立绘…</div>
+      <div class="about-close" data-action="close-skins">完成</div>
+    </div>
+
+    <!-- 说明弹窗 -->
+    <div id="about" class="hidden">
+      <div class="about-title">💙 DeepSeek 桌宠 · 小深</div>
+      <div class="about-body">
+        <p>🖱️ <b>左键拖动</b>：把我抱到别处</p>
+        <p>👆 <b>单击</b>：戳戳我</p>
+        <p>🖱️ <b>双击</b>：打开 DeepSeek 网页版</p>
+        <p>🗑️ <b>拖文件到我身上</b>：吃掉并丢进回收站</p>
+        <p>🖱️ <b>右键</b>：打开功能菜单</p>
+        <p>🎨 <b>换肤</b>：内置「经典蓝」，可导入 PNG 立绘 / 图集动画</p>
+        <p>🎬 <b>图集动画</b>：导入 Codex 格式精灵图集（1536×1872）即可获得真帧动画</p>
+        <p>🚀 <b>开机自启</b>：随 Windows 开机自动弹出</p>
+        <p>🌐 <b>快捷入口</b>：右键菜单可自定义常用/更多网站</p>
+      </div>
+      <div class="about-close" data-action="close-about">知道了~</div>
+    </div>
+
+    <!-- 网站管理面板 -->
+    <div id="sites-manager" class="hidden">
+      <div class="sm-header">
+        <span class="sm-back" data-action="sites-back">← 返回</span>
+        <span class="about-title">🔧 管理网站</span>
+        <span class="sm-back-spacer"></span>
+      </div>
+      <div class="sm-body">
+        <div class="sm-add">
+          <div class="sm-row">
+            <input id="sm-name" type="text" placeholder="名称（如 知乎）" maxlength="20" />
+            <select id="sm-level">
+              <option value="frequent">一级 · 常用</option>
+              <option value="more">二级 · 更多</option>
+            </select>
+          </div>
+          <div class="sm-row">
+            <input id="sm-url" type="text" placeholder="网址 https://..." />
+            <button id="sm-add-btn" class="sm-btn primary">＋ 添加</button>
+          </div>
+        </div>
+        <div id="sites-list"></div>
+      </div>
+      <div class="about-close" data-action="close-sites">完成</div>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

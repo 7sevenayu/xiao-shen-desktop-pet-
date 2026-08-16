@@ -1,0 +1,7 @@
+node_modules/
+.npm-cache/
+.electron-cache/
+*.log
+
+pet-config.json
+pet-log.txt

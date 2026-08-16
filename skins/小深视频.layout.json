@@ -1,0 +1,53 @@
+{
+  "skin": "小深视频.png",
+  "states": {
+    "idle": {
+      "row": 0,
+      "frames": 8,
+      "dur": 455
+    },
+    "running-right": {
+      "row": 1,
+      "frames": 8,
+      "dur": 651
+    },
+    "running-left": {
+      "mirror": "running-right"
+    },
+    "waving": {
+      "row": 2,
+      "frames": 8,
+      "dur": 488
+    },
+    "jumping": {
+      "row": 3,
+      "frames": 8,
+      "dur": 358
+    },
+    "waiting": {
+      "row": 4,
+      "frames": 8,
+      "dur": 651
+    },
+    "running": {
+      "row": 5,
+      "frames": 8,
+      "dur": 455
+    },
+    "review": {
+      "row": 6,
+      "frames": 8,
+      "dur": 651
+    },
+    "jumping-2": {
+      "row": 7,
+      "frames": 8,
+      "dur": 358
+    },
+    "waiting-2": {
+      "row": 8,
+      "frames": 8,
+      "dur": 651
+    }
+  }
+}
