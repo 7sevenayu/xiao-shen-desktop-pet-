@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <title>DeepSeek 桌宠</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -39,9 +40,9 @@
       <div class="menu-item" data-action="clipboard">📋 打开剪贴板路径</div>
       <div class="menu-item" data-action="skin">🎨 换肤</div>
       <div class="menu-item" data-action="autostart">🚀 开机自启：<b id="autostart-state">开</b></div>
-      <div class="menu-item" data-action="topmost">📌 置顶：<b id="topmost-state">开</b></div>
       <div class="menu-item" data-action="dance">🎉 来点动作</div>
       <div class="menu-item" data-action="about">ℹ️ 使用说明</div>
+      <div class="menu-item" data-action="hide">🙈 隐藏桌宠</div>
 
       <div class="menu-sep"></div>
       <div class="menu-label">🌐 快捷入口</div>
@@ -74,6 +75,7 @@
         <p>🎨 <b>换肤</b>：内置「经典蓝」，可导入 PNG 立绘 / 图集动画</p>
         <p>🎬 <b>图集动画</b>：导入 Codex 格式精灵图集（1536×1872）即可获得真帧动画</p>
         <p>🚀 <b>开机自启</b>：随 Windows 开机自动弹出</p>
+        <p>🙈 <b>隐藏桌宠</b>：右键 → 隐藏桌宠，托盘图标可唤回</p>
         <p>🌐 <b>快捷入口</b>：右键菜单可自定义常用/更多网站</p>
       </div>
       <div class="about-close" data-action="close-about">知道了~</div>

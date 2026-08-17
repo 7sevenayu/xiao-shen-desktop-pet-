@@ -34,11 +34,15 @@ contextBridge.exposeInMainWorld('petAPI', {
   openClipboardPath: () => ipcRenderer.invoke('open-clipboard-path'),
   // 鼠标穿透开关（透明区域点击直达桌面）
   setMouseIgnore: (flag) => ipcRenderer.send('set-mouse-ignore', flag),
+  // 光标屏幕位置（穿透轮询恢复用）
+  getCursorPoint: () => ipcRenderer.invoke('get-cursor-point'),
   setTopmost: (flag) => ipcRenderer.invoke('set-topmost', flag),
   getTopmost: () => ipcRenderer.invoke('get-topmost'),
   // 菜单（窗口内方案）：打开/关闭时通知主进程切换焦点策略；接收失焦关闭通知
   menuOpened: () => ipcRenderer.send('menu-opened'),
   menuClosed: () => ipcRenderer.send('menu-closed'),
   onMenuDismiss: (cb) => ipcRenderer.on('menu-dismiss', () => cb()),
+  // 隐藏桌宠（藏到托盘，不退出）
+  hidePet: () => ipcRenderer.send('hide-pet'),
   quit: () => ipcRenderer.send('quit'),
 });

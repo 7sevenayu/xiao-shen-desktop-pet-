@@ -106,7 +106,7 @@ function buildSprite(src, opts = {}) {
         const c = document.createElement('canvas');
         c.width = srcW;
         c.height = cropH;
-        const ctx = c.getContext('2d');
+        const ctx = c.getContext('2d', { willReadFrequently: true }); // getImageData 回读优化
         ctx.drawImage(img, 0, 0, srcW, cropH, 0, 0, srcW, cropH);
         if (opts.hue) {
           // 换色：保留明暗与饱和度，只替换色相（白底不受影响，稍后被 flood fill 去除）
@@ -179,7 +179,7 @@ function loadAtlas(dataUrl) {
         const c = document.createElement('canvas');
         c.width = ATLAS_W;
         c.height = ATLAS_H;
-        const ctx = c.getContext('2d');
+        const ctx = c.getContext('2d', { willReadFrequently: true }); // 行内容检测/帧蒙版会频繁 getImageData
         ctx.drawImage(img, 0, 0);
         // 检测每行是否有内容 + 每行实际帧数（有内容的列数，视频抽帧可能 4~8 帧不等）
         const id = ctx.getImageData(0, 0, ATLAS_W, ATLAS_H);
@@ -222,6 +222,26 @@ function setAtlasMode(on) {
 }
 
 // 播放一段临时状态（帧动画皮肤）
+// 状态时序：帧数/帧时长（镜像状态取源状态的值；布局状态取布局值；否则自动检测/规格表兜底）
+function stateTiming(state) {
+  const L = (atlas.layout && atlas.layout.states) ? atlas.layout.states : null;
+  const info = L ? L[state] : null;
+  let fc = 8, DUR = 100;
+  if (info && info.mirror) {
+    const src = L[info.mirror];
+    fc = src ? src.frames : 8;
+    DUR = (src && src.dur) ? src.dur : 100;
+  } else if (info) {
+    fc = info.frames;
+    DUR = info.dur || 100;
+  } else if (atlas.frameCounts[state]) {
+    fc = atlas.frameCounts[state];
+  } else if (ATLAS_STATES[state]) {
+    fc = ATLAS_STATES[state].frames;
+  }
+  return { fc: fc || 8, DUR: DUR || 100 };
+}
+
 function atlasPlay(state, ms) {
   if (!atlas.active || !atlas.source) return;
   const L = (atlas.layout && atlas.layout.states) ? atlas.layout.states : null;
@@ -358,10 +378,30 @@ function getAtlasFrameMask(row, col) {
   return m;
 }
 
+// 鼠标穿透轮询恢复：focusable:false 窗口在 Windows 上 setIgnoreMouseEvents 的
+// forward:true 转发可能失效，一旦进入穿透状态就收不到 mousemove 恢复信号。
+// 兜底：穿透期间每 120ms 向主进程要一次光标位置，自行重算是否可点击（保证宠物永远抓得住）。
+let cursorPollTimer = null;
+function ensureCursorPoll() {
+  if (cursorPollTimer) return;
+  cursorPollTimer = setInterval(async () => {
+    if (!mouseIgnored) { clearInterval(cursorPollTimer); cursorPollTimer = null; return; }
+    try {
+      const pt = await petAPI.getCursorPoint();
+      if (pt) {
+        const cx = pt.x - window.screenX;
+        const cy = pt.y - window.screenY;
+        updateClickThrough(cx, cy);
+      }
+    } catch (_) {}
+  }, 120);
+}
+
 function setMouseIgnore(ignore) {
   if (ignore === mouseIgnored) return;
   mouseIgnored = ignore;
   try { petAPI.setMouseIgnore(ignore); } catch (_) {}
+  if (ignore) ensureCursorPoll();
 }
 
 function updateClickThrough(cx, cy) {
@@ -503,22 +543,6 @@ function tick(now) {
     }
     if (!avail(want)) want = 'idle';
 
-    // 帧数/帧时长：镜像状态取源状态的值；布局状态取布局值；否则自动检测帧数
-    const info = stInfo(atlas.state);
-    let fc, DUR;
-    if (info && info.mirror) {
-      const src = stInfo(info.mirror);
-      fc = src ? src.frames : 8;
-      DUR = (src && src.dur) ? src.dur : 100;
-    } else if (info) {
-      fc = info.frames;
-      DUR = info.dur || 100;
-    } else {
-      fc = atlas.frameCounts[atlas.state] || ATLAS_STATES[atlas.state].frames;
-      DUR = 100;
-    }
-    fc = fc || 8; // 防止 NaN
-
     // 站立保持状态机：定格 ↔ 偶发动作
     const isStanding = (want === 'review') && !atlas.override && !sleeping && !dragging && !anim.chompActive;
     if (isStanding) {
@@ -545,12 +569,14 @@ function tick(now) {
       snapshotForTransition(t); // 切换前快照旧画面做交叉淡化
       atlas.state = want;
       atlas.frame = 0;
-      atlas.nextAt = t + DUR;
+      // 用新状态的帧时长排下一帧（旧实现误用了切换前状态的 DUR，切换后第一帧节奏会错一拍）
+      atlas.nextAt = t + stateTiming(atlas.state).DUR;
     } else if (isStanding && standHolding) {
       atlas.frame = STAND_HOLD_FRAME; // 定格：帧号锁死
       atlas.nextAt = t + 1e9;
     } else if (t >= atlas.nextAt) {
       snapshotForTransition(t, FRAME_BLEND_MS, 0.3); // 帧间融合：旧帧最大 30% 叠加，柔和且无鬼影
+      const { fc, DUR } = stateTiming(atlas.state);
       atlas.frame = (atlas.frame + 1) % fc;
       atlas.nextAt = t + DUR;
     }
@@ -790,7 +816,10 @@ skinsPanel.querySelector('.skin-import').addEventListener('click', async () => {
   showBubble('选择你的 PNG 立绘~ 📂', 1500);
   const skin = await petAPI.importSkin();
   if (!skin) return;
-  importedSkins.push(skin);
+  // 同名皮肤覆盖导入：替换列表里的旧条目而不是追加，避免当前会话出现重复项
+  const idx = importedSkins.findIndex((s) => s.id === skin.id);
+  if (idx >= 0) importedSkins[idx] = skin;
+  else importedSkins.push(skin);
   renderSkinList();
   await applySkin(skin.id);
 });
@@ -864,18 +893,10 @@ async function openClipboardPath() {
   showBubble(msgs[r] || msgs.invalid, 2200);
 }
 
-let topmost = true;
-async function toggleTopmost() {
-  const target = !topmost;
-  const actual = await petAPI.setTopmost(target);
-  topmost = !!actual; // 以主进程实际状态为准，避免 UI 与实际不符
-  syncMenuStates();
-  showBubble(topmost ? '我永远在最上面~ 📌' : '我沉下去啦~', 1600);
-}
-
 let autoStart = true;
 async function toggleAutoStart() {
-  autoStart = await petAPI.setAutoStart(!autoStart);
+  const res = await petAPI.setAutoStart(!autoStart);
+  if (typeof res === 'boolean') autoStart = res; // null=操作失败，保持原状态显示
   syncMenuStates();
   showBubble(autoStart ? '开机自启已开启，下次开机我自动出现~ 🚀' : '开机自启已关闭', 1800);
 }
@@ -908,12 +929,10 @@ async function eatFiles(files) {
 // ---------- 菜单（窗口内：菜单渲染在桌宠窗口左侧透明区，不遮挡浏览器，不暂停视频） ----------
 let menuOpen = false;
 const menu = document.getElementById('menu');
-const topmostState = document.getElementById('topmost-state');
 const autostartState = document.getElementById('autostart-state');
 
 // 菜单里的「开/关」状态显示跟随实际状态
 function syncMenuStates() {
-  if (topmostState) topmostState.textContent = topmost ? '开' : '关';
   if (autostartState) autostartState.textContent = autoStart ? '开' : '关';
 }
 
@@ -947,6 +966,14 @@ function hideMenu() {
   try { petAPI.menuClosed(); } catch (_) {}
 }
 
+// 隐藏桌宠：说句再见再藏到托盘（托盘图标可唤回）
+function hidePet() {
+  hideMenu();
+  showBubble('我藏起来啦，想我的时候点托盘图标~ 🙈', 1300);
+  spawnSparkles(4);
+  setTimeout(() => { try { petAPI.hidePet(); } catch (_) {} }, 700); // 让气泡说完再消失
+}
+
 // 执行菜单动作
 function runMenuAction(action) {
   switch (action) {
@@ -958,9 +985,9 @@ function runMenuAction(action) {
     case 'media-next': mediaControl('next', '⏭ 已发送下一首'); break;
     case 'skin': renderSkinList(); skinsPanel.classList.remove('hidden'); setMouseIgnore(false); break;
     case 'autostart': toggleAutoStart(); break;
-    case 'topmost': toggleTopmost(); break;
     case 'dance': dance(); break;
     case 'about': about.classList.remove('hidden'); setMouseIgnore(false); break;
+    case 'hide': hidePet(); break;
     case 'quit': petAPI.quit(); break;
   }
 }
@@ -1194,7 +1221,8 @@ function endDrag(e) {
   targetLift = 1;
   // 关键：显式释放指针捕获，避免残留捕获导致后续“幽灵拖动”
   try { pet.releasePointerCapture(e.pointerId); } catch (_) {}
-  petAPI.log('drag-end win=(' + Math.round(window.screenX) + ',' + Math.round(window.screenY) + ')');
+  try { petAPI.dragEnd(); } catch (_) {} // 通知主进程清空拖动状态（此前一直漏发，主进程 drag 状态残留）
+  if (moved) petAPI.log('drag-end win=(' + Math.round(window.screenX) + ',' + Math.round(window.screenY) + ')');
   anim.bounceV = -4; // 轻轻落地弹一下
   if (lastMouse) updateClickThrough(lastMouse.x, lastMouse.y);
   if (!moved) {
@@ -1317,9 +1345,6 @@ function scheduleTip() {
     currentSkinId = skins.current || 'classic';
     const cfg = await petAPI.getConfig();
     autoStart = !!cfg.autoStart;
-    try {
-      topmost = !!(await petAPI.getTopmost());
-    } catch (_) {}
     desktopBounds = await petAPI.getBounds();
     try { sites = await petAPI.getSites(); } catch (_) {}
     renderSitesMenu(); // 快捷入口（一级网格 / 二级列表 / 计数）
@@ -1360,4 +1385,5 @@ function scheduleTip() {
   requestAnimationFrame(tick);
   scheduleTip();
   showBubble('你好呀，我是小深~ 💙', 2600);
+  window.__petReady = true; // 自检模式（--selftest）的初始化完成标记
 })();

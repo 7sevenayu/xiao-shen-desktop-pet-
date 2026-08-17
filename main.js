@@ -6,9 +6,15 @@ const path = require('path');
 
 // ---------- 诊断日志 ----------
 const LOG_FILE = path.join(__dirname, 'pet-log.txt');
+const LOG_MAX_BYTES = 1024 * 1024; // 超过 1MB 自动轮转到 pet-log.old.txt，防止日志无限增长
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
-  try { fs.appendFileSync(LOG_FILE, line, 'utf8'); } catch (_) {}
+  try {
+    if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) {
+      try { fs.renameSync(LOG_FILE, path.join(__dirname, 'pet-log.old.txt')); } catch (_) {}
+    }
+    fs.appendFileSync(LOG_FILE, line, 'utf8');
+  } catch (_) {}
   try { console.log('[pet]', msg); } catch (_) {}
 }
 log(`===== 启动 app dir = ${__dirname} =====`);
@@ -85,19 +91,21 @@ function getAutoStart() {
       const child = spawn('reg.exe', ['query', AUTOSTART_KEY, '/v', AUTOSTART_NAME], { windowsHide: true });
       let out = '';
       child.stdout.on('data', (d) => { out += String(d); });
-      child.on('error', () => resolve(false));
+      child.on('error', () => resolve(null)); // 查询本身失败（reg 缺失/管道受限）→ null，调用方不做同步
       child.on('close', (code) => resolve(code === 0 && out.includes(AUTOSTART_NAME)));
-    } catch (_) { resolve(false); }
+    } catch (_) { resolve(null); }
   });
 }
 
 async function setAutoStart(enable) {
+  let ok = false;
   if (enable) {
     const value = `"${process.execPath}" "${path.resolve(__dirname)}"`;
-    await regRun(['add', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', value, '/f']);
+    ok = await regRun(['add', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/t', 'REG_SZ', '/d', value, '/f']);
   } else {
-    await regRun(['delete', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/f']);
+    ok = await regRun(['delete', AUTOSTART_KEY, '/v', AUTOSTART_NAME, '/f']);
   }
+  if (!ok) return null; // 写入/删除失败：不把失败当“已关闭”，避免污染配置
   return getAutoStart();
 }
 
@@ -195,39 +203,63 @@ function setTopmostNative(enable) {
       const hwnd = handle.length >= 8 ? handle.readBigUInt64LE(0).toString() : handle.readUInt32LE(0).toString();
       const ps = [
         '$h=[IntPtr]::new([Int64]' + hwnd + ')',
-        '$after=[IntPtr]::new([Int64]' + (enable ? '-1' : '1') + ')',
-        '$sig=\'[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags); [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd); [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder s, int n); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);\'',
+        '$sig=\'[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);\'',
         '$tp=Add-Type -MemberDefinition $sig -Name WinPos -Namespace NP -PassThru',
-        // 19 = SWP_NOSIZE(1) | SWP_NOMOVE(2) | SWP_NOACTIVATE(16)
-        '$ok=$tp::SetWindowPos($h,$after,0,0,0,0,19)',
       ];
-      if (!enable) {
-        // 诊断：打印 z 序底部 6 个窗口的类名与进程，便于排查壁纸层结构
+      if (enable) {
+        // 开 → HWND_TOPMOST（悬浮在最上）
+        ps.push('$ok=$tp::SetWindowPos($h,[IntPtr]::new([Int64]-1),0,0,0,0,19)');
+      } else {
+        // 关 → 直接用 EnumWindows 定位「最高的可见壁纸层窗口」并贴到它之下（壁纸之上、窗口之下）。
+        // 注意：GetWindow([IntPtr]::Zero, FIRST/LAST) 在 Win11 恒返回 NULL（旧实现的 HWND_BOTTOM
+        // 会把宠物钉到壁纸之下 → 桌宠“消失”），这里用 EnumWindows 遍历顶层窗口。
         ps.push(
-          '$w=$tp::GetWindow([IntPtr]::Zero,1)',
-          '$sb=New-Object System.Text.StringBuilder 256',
-          'for($i=0;$i -lt 6 -and $w -ne [IntPtr]::Zero;$i++){',
-          '  $null=$sb.Clear()',
-          '  $null=$tp::GetClassName($w,$sb,256)',
-          '  $p=[uint32]0',
-          '  $null=$tp::GetWindowThreadProcessId($w,[ref]$p)',
-          '  $pn=""',
-          '  if($p -ne 0){ $pr=Get-Process -Id $p -ErrorAction SilentlyContinue; if($pr){$pn=$pr.ProcessName} }',
-          '  "z$i cls=" + $sb.ToString() + " proc=" + $pn',
-          '  $w=$tp::GetWindow($w,3)',
+          '$sig2=@\'',
+          'using System;',
+          'using System.Runtime.InteropServices;',
+          'using System.Text;',
+          'public class DesktopPin {',
+          '  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);',
+          '  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);',
+          '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+          '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+          '  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);',
+          '  public static IntPtr FindWall() {',
+          '    IntPtr wall = IntPtr.Zero;',
+          '    EnumWindows((h, p) => {',
+          '      if (wall != IntPtr.Zero) return true;',
+          '      var sb = new StringBuilder(256); GetClassName(h, sb, 256);',
+          '      var cls = sb.ToString();',
+          '      if (cls == "Progman" || cls == "WorkerW") { if (IsWindowVisible(h)) wall = h; return true; }',
+          '      uint pid = 0; GetWindowThreadProcessId(h, out pid);',
+          '      if (pid != 0) { try { var pr = System.Diagnostics.Process.GetProcessById((int)pid); if (pr != null && pr.ProcessName.StartsWith("wallpaper", StringComparison.OrdinalIgnoreCase) && IsWindowVisible(h)) wall = h; } catch {} }',
+          '      return true;',
+          '    }, IntPtr.Zero);',
+          '    return wall;',
+          '  }',
+          '}',
+          "'@",
+          '$null = Add-Type -TypeDefinition $sig2',
+          '$wall = [DesktopPin]::FindWall()',
+          '"wall=" + $wall',
+          'if ($wall -ne [IntPtr]::Zero) {',
+          '  $ok = $tp::SetWindowPos($h, $wall, 0, 0, 0, 0, 19)',
+          '} else {',
+          '  $ok = $tp::SetWindowPos($h, [IntPtr]::new([Int64]1), 0, 0, 0, 0, 19)',
           '}',
         );
       }
       ps.push('if($ok){exit 0}else{exit 1}');
-      const script = ps.join('; ');
+      // 注意必须用换行连接：$sig2=@'...'@ here-string 要求 `@'` 在行尾、`'@` 在行首
+      const script = ps.join('\n');
       // 不设 stdio:'ignore'：捕获 stdout/stderr，失败或诊断信息写进日志
       execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 15000 }, (err, _stdout, stderr) => {
         if (err) {
           const detail = stderr ? ' stderr=' + String(stderr).trim().slice(0, 200) : '';
           log('原生置顶调用失败:' + detail + ' | ' + ((err && err.message) || err));
         } else if (!enable && _stdout) {
-          const diag = String(_stdout).trim().split('\n').slice(0, 6).map((s) => s.trim()).join(' | ');
-          if (diag) log('置顶关 z序诊断: ' + diag);
+          const diag = String(_stdout).trim().split('\n').map((s) => s.trim()).filter(Boolean).join(' | ');
+          if (diag) log('置顶关 贴壁纸层: ' + diag);
         }
         resolve(!err);
       });
@@ -258,67 +290,71 @@ function startTopmostWatcher() {
     const script = [
       "$sig=@'",
       'using System;',
+      'using System.Collections.Generic;',
       'using System.Runtime.InteropServices;',
+      'using System.Text;',
       'public class PetWatch {',
       '  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int X, int Y, int cx, int cy, uint f);',
-      '  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);',
       '  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);',
-      '  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);',
+      '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+      '  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);',
+      '  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);',
       '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);',
+      '  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);',
+      '  public static List<IntPtr> TopLevel() { var l = new List<IntPtr>(); EnumWindows((h, p) => { l.Add(h); return true; }, IntPtr.Zero); return l; }',
+      '  // 壁纸层判定：可见的 Progman/WorkerW，或进程名 wallpaper*（Wallpaper Engine）的可见窗口',
+      '  public static bool IsWallpaper(IntPtr h) {',
+      '    var sb = new StringBuilder(256); GetClassName(h, sb, 256);',
+      '    var cls = sb.ToString();',
+      '    if (cls == "Progman" || cls == "WorkerW") return IsWindowVisible(h);',
+      '    uint p = 0; GetWindowThreadProcessId(h, out p);',
+      '    if (p != 0) { try { var pr = System.Diagnostics.Process.GetProcessById((int)p); if (pr != null && pr.ProcessName.StartsWith("wallpaper", StringComparison.OrdinalIgnoreCase)) return IsWindowVisible(h); } catch {} }',
+      '    return false;',
+      '  }',
       '}',
       "'@",
       '$null = Add-Type -TypeDefinition $sig',
-      '$pet = [IntPtr]::new([Int64]$args[0])',
-      '$sb = New-Object System.Text.StringBuilder 256',
+      // hwnd 必须内联进脚本：PowerShell 的 -Command 会把尾部参数拼进命令文本，$args[0] 恒为空，
+      // 曾导致 IsWindow(0)=false → 守护启动即退出（pet-log 里“置顶守护意外退出”连刷的根因）
+      '$pet = [IntPtr]::new([Int64]' + hwnd + ')',
       'while ([PetWatch]::IsWindow($pet)) {',
-      '  $cur = [PetWatch]::GetWindow([IntPtr]::Zero, 1)',
-      '  $lastDesktop = [IntPtr]::Zero',
-      '  while ($cur -ne [IntPtr]::Zero) {',
-      '    if ($cur -eq $pet) { $cur = [PetWatch]::GetWindow($cur, 3); continue }',
-      '    $null = $sb.Clear()',
-      '    $null = [PetWatch]::GetClassName($cur, $sb, 256)',
-      '    $cls = $sb.ToString()',
-      '    $p = [uint32]0',
-      '    $null = [PetWatch]::GetWindowThreadProcessId($cur, [ref]$p)',
-      '    $pn = ""',
-      '    if ($p -ne 0) { $pr = Get-Process -Id $p -ErrorAction SilentlyContinue; if ($pr) { $pn = $pr.ProcessName } }',
-      '    if ($cls -eq "Progman" -or $cls -eq "WorkerW" -or $pn -like "wallpaper*") {',
-      '      $lastDesktop = $cur',
-      '      $cur = [PetWatch]::GetWindow($cur, 3)',
-      '      continue',
-      '    }',
-      '    break',
-      '  }',
-      '  if ($lastDesktop -ne [IntPtr]::Zero) {',
-      '    $null = [PetWatch]::SetWindowPos($pet, $lastDesktop, 0, 0, 0, 0, 19)',
+      // 用 EnumWindows 找「最高的可见壁纸层窗口」：GetWindow(Zero, FIRST/LAST) 在 Win11 上
+      // 恒返回 NULL，旧实现永远落到 HWND_BOTTOM，把宠物钉到壁纸之下 → 桌宠“消失”的根因
+      '  $wall = [IntPtr]::Zero',
+      '  foreach ($h in [PetWatch]::TopLevel()) { if ([PetWatch]::IsWallpaper($h)) { $wall = $h; break } }',
+      '  if ($wall -ne [IntPtr]::Zero) {',
+      '    $null = [PetWatch]::SetWindowPos($pet, $wall, 0, 0, 0, 0, 19)',
       '  } else {',
       '    $null = [PetWatch]::SetWindowPos($pet, [IntPtr]::new([Int64]1), 0, 0, 0, 0, 19)',
       '  }',
       '  Start-Sleep -Seconds 1',
       '}',
     ].join('\n');
-    topmostWatcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script, hwnd], { detached: true, stdio: 'ignore', windowsHide: true });
+    topmostWatcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: 'ignore', windowsHide: true });
     const child = topmostWatcher;
-    topmostWatcher.on('exit', () => {
+    topmostWatcher.on('exit', (code) => {
+      // 只有“当前守护就是我”时才处理：被 killTopmostWatcher 主动终止或已被新守护接管的
+      // 过期退出事件直接忽略，避免误清空新守护引用 / 重复拉起第二只守护（竞态 bug）
+      if (topmostWatcher !== child) return;
       topmostWatcher = null;
-      // 守护意外退出（被杀软误杀/崩溃等）：置顶仍为关时 3 秒后自动重启，最多连续 3 次
+      // 守护意外退出（被杀软误杀/崩溃/脚本错误等）：置顶仍为关时 3 秒后自动重启，最多连续 3 次
       if (!topmostOn && !isQuitting && win) {
         if (watcherRestarts >= 3) {
           log('置顶守护连续退出超过3次，停止自动重启（重新切换置顶可恢复）');
           return;
         }
         watcherRestarts++;
-        log('置顶守护意外退出，3秒后自动重启（第' + watcherRestarts + '次）');
+        log('置顶守护意外退出(code=' + code + ')，3秒后自动重启（第' + watcherRestarts + '次）');
         setTimeout(() => {
           if (!topmostOn && !isQuitting && win) startTopmostWatcher();
         }, 3000);
       }
     });
-    topmostWatcher.on('error', () => { topmostWatcher = null; });
+    topmostWatcher.on('error', (err) => { log('置顶守护启动失败: ' + err); topmostWatcher = null; });
     topmostWatcher.unref();
     // 存活超过 5 秒视为健康，清零连续退出计数
     setTimeout(() => { if (topmostWatcher === child) watcherRestarts = 0; }, 5000);
-    log('置顶守护启动（每秒贴回壁纸层之上）');
+    log('置顶守护启动（每秒贴回壁纸层之上, pid=' + (child.pid || '?') + '）');
   } catch (e) {
     log('置顶守护启动失败: ' + e);
   }
@@ -359,9 +395,23 @@ function createWindow() {
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     log(`[did-fail-load] ${code} ${desc} ${url}`);
   });
+  let rendererCrashes = 0; // 60 秒内渲染进程崩溃计数（自动恢复保护）
   win.webContents.on('render-process-gone', (_e, details) => {
     log(`[render-process-gone] ${JSON.stringify(details)}`);
+    // 渲染进程崩溃/被杀后自动恢复，避免桌宠变成“死窗”；1 分钟内最多自动恢复 3 次防死循环
+    if (isQuitting) return;
+    if (++rendererCrashes > 3) {
+      log('渲染进程 1 分钟内崩溃超过 3 次，停止自动恢复');
+      return;
+    }
+    setTimeout(() => {
+      rendererCrashes = Math.max(0, rendererCrashes - 1);
+      if (isQuitting || !win) return;
+      log('渲染进程自动恢复：重新加载页面');
+      try { win.webContents.reload(); } catch (e) { log('渲染进程自动恢复失败: ' + e); }
+    }, 800);
   });
+  setInterval(() => { rendererCrashes = 0; }, 60000);
 
   const { workArea } = screen.getPrimaryDisplay();
   win.setPosition(
@@ -394,8 +444,19 @@ function showPet() {
   if (!win) return;
   if (win.isMinimized()) win.restore();
   win.show();
+  try { win.webContents.setBackgroundThrottling(false); } catch (_) {} // 恢复动画
   if (topmostOn) win.moveTop();
 }
+
+// 隐藏宠物：藏到托盘不退出（动画同时暂停省 CPU），托盘「显示桌宠」/ 双击托盘图标唤回
+function hidePet() {
+  if (!win) return;
+  try { win.webContents.setBackgroundThrottling(true); } catch (_) {} // 隐藏时暂停动画
+  win.hide();
+  log('桌宠已隐藏（托盘可唤回）');
+}
+
+ipcMain.on('hide-pet', () => hidePet());
 
 // ---------- 音乐控制（媒体键模拟）----------
 // VK_MEDIA_PLAY_PAUSE=0xB3 / VK_MEDIA_NEXT_TRACK=0xB0 / VK_MEDIA_PREV_TRACK=0xB1
@@ -430,6 +491,7 @@ ipcMain.handle('media-control', async (_e, action) => {
 function buildTrayMenu() {
   return Menu.buildFromTemplate([
     { label: '显示桌宠', click: showPet },
+    { label: '🙈 隐藏桌宠', click: hidePet },
     { type: 'separator' },
     { label: '🌐 打开 DeepSeek 网页版', click: () => openDeepseek() },
     { label: '🤖 启动 dsh', click: () => { launchDsh(); } },
@@ -439,21 +501,12 @@ function buildTrayMenu() {
     { label: '⏭ 下一首', click: () => { sendMediaKey(0xB0); } },
     { type: 'separator' },
     {
-      label: '📌 置顶', type: 'checkbox', checked: topmostOn,
-      click: async (item) => {
-        await setTopmostFromMain(!!item.checked);
-        if (tray) tray.setContextMenu(buildTrayMenu());
-      },
-    },
-    { type: 'separator' },
-    {
       label: '🚀 开机自启', type: 'checkbox', checked: !!config.autoStart,
       click: async (item) => {
         const ok = await setAutoStart(!!item.checked);
-        config.autoStart = ok;
-        saveConfig(config);
+        if (typeof ok === 'boolean') { config.autoStart = ok; saveConfig(config); }
         if (tray) tray.setContextMenu(buildTrayMenu());
-        log('开机自启 -> ' + (ok ? '开' : '关'));
+        log('开机自启 -> ' + (ok === null ? '操作失败' : ok ? '开' : '关'));
       },
     },
     { type: 'separator' },
@@ -495,10 +548,9 @@ ipcMain.handle('get-skins', () => ({
 
 ipcMain.handle('set-auto-start', async (_e, enable) => {
   const ok = await setAutoStart(!!enable);
-  config.autoStart = ok;
-  saveConfig(config);
+  if (typeof ok === 'boolean') { config.autoStart = ok; saveConfig(config); }
   if (tray) tray.setContextMenu(buildTrayMenu());
-  log('开机自启 -> ' + (ok ? '开' : '关'));
+  log('开机自启 -> ' + (ok === null ? '操作失败' : ok ? '开' : '关'));
   return ok;
 });
 
@@ -518,6 +570,11 @@ ipcMain.handle('import-skin', async () => {
     const ext = path.extname(name).toLowerCase();
     const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
     const skin = { id: 'imported:' + name, name: name.replace(/\.[^.]+$/, ''), dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64') };
+    // 同名布局描述（多行动画/镜像/帧时长）：<皮肤名>.layout.json，与 getImportedSkins 保持一致
+    try {
+      const lp = path.join(SKINS_DIR, name.replace(/\.[^.]+$/, '') + '.layout.json');
+      if (fs.existsSync(lp)) skin.layout = JSON.parse(fs.readFileSync(lp, 'utf8'));
+    } catch (_) {}
     log('导入皮肤成功: ' + name);
     return skin;
   } catch (e) {
@@ -563,17 +620,25 @@ ipcMain.handle('trash-items', async (_e, paths) => {
 // 拖动：渲染进程发「相对起点的 client 位移」+ 主进程按起点窗口位置累加，
 // client 坐标是 CSS 像素（DIP），与 getPosition 同一坐标系，彻底避免 DPI 漂移
 let dragMoveCount = 0;
+let dragPausedWatcher = false; // 拖动期间是否暂停了置顶守护
 ipcMain.on('drag-start', () => {
   if (!win) return;
   // 拖动前先把窗口尺寸钉回标准值（防御：某种原因曾把它放大）
+  const [w, h] = win.getSize();
   win.setSize(PET_W, PET_H);
   const [wx, wy] = win.getPosition();
   drag = { wx, wy };
   dragMoveCount = 0;
-  // 诊断：区分“窗口真的变大”还是“页面被缩放”（innerWidth 变大但窗口尺寸不变）
+  // 拖动期间暂停置顶守护：守护每秒对窗口做一次 SetWindowPos（改 z 序），与拖动的
+  // 窗口移动并发会打断指针捕获/拖动（用户报告：反复切换置顶后无法拖动）
+  dragPausedWatcher = !!topmostWatcher;
+  if (topmostWatcher) killTopmostWatcher();
+  // 诊断：只在异常时打日志（尺寸/缩放不是标准值），正常拖动不再刷屏
   let zoom = '?';
   try { zoom = String(win.webContents.getZoomFactor()); } catch (_) {}
-  log('[drag] start win=(' + wx + ',' + wy + ') size=' + JSON.stringify(win.getSize()) + ' zoom=' + zoom);
+  if (w !== PET_W || h !== PET_H || zoom !== '1') {
+    log('[drag] start 异常尺寸 win=(' + wx + ',' + wy + ') size=' + JSON.stringify([w, h]) + ' zoom=' + zoom + ' -> 已钉回 ' + PET_W + 'x' + PET_H);
+  }
 });
 
 ipcMain.on('drag-move', (_e, p) => {
@@ -593,7 +658,14 @@ ipcMain.on('drag-move', (_e, p) => {
   }
 });
 
-ipcMain.on('drag-end', () => { drag = null; });
+ipcMain.on('drag-end', () => {
+  drag = null;
+  // 拖动结束：若之前暂停了守护且置顶仍为关，恢复守护把宠物贴回桌面层
+  if (dragPausedWatcher) {
+    dragPausedWatcher = false;
+    if (!topmostOn && !isQuitting && win) startTopmostWatcher();
+  }
+});
 
 // 菜单（窗口内菜单方案）：打开菜单时窗口临时可聚焦，点菜单外任意处 → 窗口失焦 → 关闭菜单。
 // 没有全屏覆盖窗口，浏览器永远不会被遮挡，网页视频不会暂停
@@ -651,27 +723,45 @@ ipcMain.on('set-mouse-ignore', (_e, flag) => {
   if (win) win.setIgnoreMouseEvents(!!flag, { forward: true });
 });
 
-async function setTopmostFromMain(enable) {
-  if (!win) return false;
-  topmostOn = enable;
-  // 先走 Electron API（更新内部状态；mac/Linux 直接生效）
-  win.setAlwaysOnTop(enable, 'floating');
-  if (enable) win.moveTop(); // 开启时立即抬升，保证回到最前
-  // Windows 再用原生调用兜底（修复 #45024）：开→TOPMOST；关→落底桌面层（HWND_BOTTOM）
-  let nativeOk = true;
-  if (process.platform === 'win32') {
-    nativeOk = await setTopmostNative(enable);
-    if (enable) {
-      killTopmostWatcher(); // 悬浮模式不需要守护
-    } else {
-      startTopmostWatcher(); // 即使一次性调用失败，守护也能在1秒内把宠物贴回壁纸层
+// 光标屏幕位置：渲染进程在穿透状态下轮询此接口自行恢复可点击（forward 转发失效的兜底）
+ipcMain.handle('get-cursor-point', () => {
+  try { const p = screen.getCursorScreenPoint(); return { x: p.x, y: p.y }; } catch (_) { return null; }
+});
+
+// 置顶切换串行化：快速反复切换时，多个 setTopmostFromMain 的异步原生调用会交错，
+// 导致 topmostOn 与窗口真实层级/守护状态脱节。用队列让每次切换完整跑完再处理下一次。
+let topmostQueue = Promise.resolve();
+function setTopmostFromMain(enable) {
+  const task = async () => {
+    if (!win) return false;
+    topmostOn = enable;
+    // 先走 Electron API（更新内部状态；mac/Linux 直接生效）
+    win.setAlwaysOnTop(enable, 'floating');
+    if (enable) win.moveTop(); // 开启时立即抬升，保证回到最前
+    // Windows 再用原生调用兜底（修复 #45024）：开→TOPMOST；关→落底桌面层（HWND_BOTTOM）
+    let nativeOk = true;
+    if (process.platform === 'win32') {
+      nativeOk = await setTopmostNative(enable);
+      if (enable) {
+        killTopmostWatcher(); // 悬浮模式不需要守护
+      } else {
+        startTopmostWatcher(); // 即使一次性调用失败，守护也能在1秒内把宠物贴回壁纸层
+      }
     }
-  }
-  log('置顶开关 -> ' + (enable ? '开' : '关') + ' (native=' + nativeOk + ')');
-  return win.isAlwaysOnTop();
+    log('置顶开关 -> ' + (enable ? '开' : '关') + ' (native=' + nativeOk + ')');
+    return topmostOn;
+  };
+  const run = topmostQueue.then(task, task);
+  topmostQueue = run.then(() => {}, () => {});
+  return run;
 }
 
-ipcMain.handle('set-topmost', (_e, flag) => setTopmostFromMain(!!flag));
+ipcMain.handle('set-topmost', async (_e, flag) => {
+  await setTopmostFromMain(!!flag);
+  // 返回主进程镜像状态而非 win.isAlwaysOnTop()：
+  // Electron #45024 下 focusable:false 窗口的内部标志可能滞后于真实层级，导致 UI 状态与实际不符
+  return topmostOn;
+});
 
 ipcMain.handle('get-topmost', () => topmostOn);
 
@@ -703,7 +793,9 @@ function computeDesktopBounds() {
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   log('检测到已有桌宠在运行，本实例退出');
-  app.quit();
+  // 必须用 app.exit(0)：app.quit() 在 ready 之前调用不会真正终止进程，
+  // 实测会在后台留下一个无窗口无托盘的幽灵进程（白占内存、干扰排查）
+  app.exit(0);
 } else {
   app.on('second-instance', () => {
     log('重复启动被拦截，聚焦现有桌宠窗口');
@@ -720,15 +812,17 @@ if (!gotLock) {
       saveConfig(config);
     }
     setAutoStart(config.autoStart).then((ok) => {
-      if (ok !== config.autoStart) {
+      if (typeof ok === 'boolean' && ok !== config.autoStart) {
         config.autoStart = ok;
         saveConfig(config);
       }
-      log('开机自启状态: ' + (ok ? '开' : '关'));
+      log('开机自启状态: ' + (ok === null ? '查询失败(未同步)' : ok ? '开' : '关'));
     });
 
     createWindow();
     createTray();
+
+    if (SELFTEST) runSelfTest();
   });
 
   app.on('will-quit', () => { killTopmostWatcher(); });
@@ -736,4 +830,212 @@ if (!gotLock) {
   app.on('window-all-closed', () => {
     // Windows 下保持托盘常驻，除非显式退出
   });
+}
+
+// ---------- 自检模式（npm run selftest / electron . --selftest）----------
+// 不碰真实副作用（不开网页、不发媒体键、不删文件、不改注册表），
+// 只在真实窗口上验证核心链路并把 PASS/FAIL 写进 pet-log.txt，最后自动退出。
+const SELFTEST = process.argv.includes('--selftest');
+
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (_) { return false; }
+}
+
+async function runSelfTest() {
+  // 看门狗：任何一步卡死（渲染进程挂起/加载失败等）都强制结束，绝不让自检无限等待
+  const watchdog = setTimeout(() => {
+    log('[selftest] 看门狗超时（60s）强制退出');
+    try { fs.writeFileSync(path.join(__dirname, 'selftest-watchdog.txt'), 'timeout at ' + new Date().toISOString()); } catch (_) {}
+    killTopmostWatcher();
+    isQuitting = true;
+    app.exit(3);
+  }, 60000);
+  const results = [];
+  const report = (name, ok, detail) => {
+    results.push({ name, ok, detail: String(detail || '') });
+    log('[selftest] ' + (ok ? 'PASS' : 'FAIL') + ' ' + name + (detail ? ' | ' + detail : ''));
+  };
+  const originalSkin = config.skin;
+  const originalPos = win.getPosition();
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+  const closeEnough = (a, b) => Math.abs(a - b) <= 1; // DIP↔像素换算会有 ±1px 取整
+
+  try {
+    // 等待页面加载 + 渲染进程初始化
+    if (win.webContents.isLoading()) await new Promise((r) => win.webContents.once('did-finish-load', r));
+    await delay(3000);
+
+    // 1. 渲染进程初始化完成标记
+    const ready = await win.webContents.executeJavaScript('!!window.__petReady');
+    report('renderer-init', ready === true);
+
+    // 2. 当前皮肤应为图集动画（小深视频.png）
+    const atlasInfo = await win.webContents.executeJavaScript(
+      'JSON.stringify({active: atlas.active, state: atlas.state, hasSource: !!atlas.source, cw: spriteCanvas.width, ch: spriteCanvas.height})'
+    );
+    let atlasOk = false;
+    try { const a = JSON.parse(atlasInfo); atlasOk = a.active && a.hasSource && a.cw === 384 && a.ch === 416; } catch (_) {}
+    report('atlas-active', atlasOk, atlasInfo);
+
+    // 3. 皮肤切换往返：图集 -> classic（静态）-> 图集
+    await win.webContents.executeJavaScript('applySkin("classic", true)');
+    await delay(1500);
+    const classicState = await win.webContents.executeJavaScript(
+      'JSON.stringify({active: atlas.active, spriteNaturalW: sprite.naturalWidth})'
+    );
+    let classicOk = false;
+    try { const c = JSON.parse(classicState); classicOk = !c.active && c.spriteNaturalW > 0; } catch (_) {}
+    report('skin-switch-classic', classicOk, classicState);
+
+    await win.webContents.executeJavaScript('applySkin("imported:小深视频.png", true)');
+    await delay(1500);
+    const backState = await win.webContents.executeJavaScript(
+      'JSON.stringify({active: atlas.active, hasSource: !!atlas.source})'
+    );
+    let backOk = false;
+    try { const b = JSON.parse(backState); backOk = b.active && b.hasSource; } catch (_) {}
+    report('skin-switch-atlas-back', backOk, backState);
+
+    // 4. 拖动 IPC 往返：drag-start -> drag-move(40,30) -> drag-end，窗口应移动且主进程 drag 状态被清空
+    const [wx0, wy0] = win.getPosition();
+    await win.webContents.executeJavaScript('petAPI.dragStart(); petAPI.dragMove(40, 30); petAPI.dragEnd(); true');
+    await delay(300);
+    const [wx1, wy1] = win.getPosition();
+    const expX = clampNum(wx0 + 40, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
+    const expY = clampNum(wy0 + 30, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    report('drag-ipc', closeEnough(wx1, expX) && closeEnough(wy1, expY) && drag === null,
+      'from=(' + wx0 + ',' + wy0 + ') to=(' + wx1 + ',' + wy1 + ') expect=(' + expX + ',' + expY + ') dragState=' + JSON.stringify(drag));
+
+    // 5. 置顶往返：开 -> 关（守护必须存活）-> 开（守护被终止）
+    await setTopmostFromMain(true);
+    await delay(600);
+    const onOk = topmostOn === true;
+    await setTopmostFromMain(false);
+    await delay(3000); // 给守护启动时间；旧 bug 下守护 1 秒内即退出
+    const watcherPid = topmostWatcher ? topmostWatcher.pid : null;
+    const watcherAlive = watcherPid ? isPidAlive(watcherPid) : false;
+    report('topmost-watcher-alive', onOk && watcherAlive, 'on=' + onOk + ' watcherPid=' + (watcherPid || 'null') + ' alive=' + watcherAlive);
+    await setTopmostFromMain(true);
+    await delay(600);
+    report('topmost-back-on', topmostOn === true && !topmostWatcher, 'topmostOn=' + topmostOn + ' watcherCleared=' + !topmostWatcher);
+
+    // 5b. 回归：反复切换置顶后，拖动是否仍然有效（用户报告：置顶重复后无法拖动）
+    for (let i = 0; i < 8; i++) {
+      await setTopmostFromMain(false);
+      await delay(200);
+      await setTopmostFromMain(true);
+      await delay(200);
+    }
+    await delay(500);
+    const [cx0, cy0] = win.getPosition();
+    const boundsBefore = win.getBounds();
+    await win.webContents.executeJavaScript('petAPI.dragStart(); petAPI.dragMove(60, 40); petAPI.dragEnd(); true');
+    await delay(400);
+    const [cx1, cy1] = win.getPosition();
+    const cexpX = clampNum(cx0 + 60, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
+    const cexpY = clampNum(cy0 + 40, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    report('drag-after-topmost-cycling', closeEnough(cx1, cexpX) && closeEnough(cy1, cexpY) && drag === null,
+      'from=(' + cx0 + ',' + cy0 + ') to=(' + cx1 + ',' + cy1 + ') expect=(' + cexpX + ',' + cexpY + ') boundsBefore=' + JSON.stringify(boundsBefore) + ' dragState=' + JSON.stringify(drag));
+
+    // 5c. 置顶关（守护运行中）拖动：窗口应移动，且守护周期内位置不被钉回
+    await setTopmostFromMain(false);
+    await delay(900); // 让守护跑起来
+    const [wx2, wy2] = win.getPosition();
+    await win.webContents.executeJavaScript('petAPI.dragStart(); petAPI.dragMove(-50, -35); petAPI.dragEnd(); true');
+    await delay(400);
+    const [wx3, wy3] = win.getPosition();
+    await delay(2600); // 等守护跑 2 个周期，看是否被钉回
+    const [wx4, wy4] = win.getPosition();
+    const wex = clampNum(wx2 - 50, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
+    const wey = clampNum(wy2 - 35, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    report('drag-while-watcher-running', closeEnough(wx3, wex) && closeEnough(wy3, wey) && closeEnough(wx4, wx3) && closeEnough(wy4, wy3),
+      'from=(' + wx2 + ',' + wy2 + ') after=(' + wx3 + ',' + wy3 + ') after2s=(' + wx4 + ',' + wy4 + ') expect=(' + wex + ',' + wey + ')');
+    await setTopmostFromMain(true);
+    await delay(400);
+
+    // 5d. 置顶关（守护运行中）：宠物 z 序应位于壁纸层之上（可见，不再“消失”）
+    await setTopmostFromMain(false);
+    await delay(2000); // 等守护完成一次贴回
+    const pHandle = win.getNativeWindowHandle();
+    const pPetHwnd = pHandle.length >= 8 ? pHandle.readBigUInt64LE(0).toString() : pHandle.readUInt32LE(0).toString();
+    const probe = [
+      '$sig=@\'',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'using System.Text;',
+      'public class Probe {',
+      '  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);',
+      '  [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);',
+      '  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
+      '  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);',
+      '  public static string Run(IntPtr pet) {',
+      '    var sb = new StringBuilder(256);',
+      '    int petIdx = -1, wallIdx = -1, idx = 0;',
+      '    EnumWindows((h, p) => {',
+      '      if (h == pet) petIdx = idx;',
+      '      GetClassName(h, sb, 256);',
+      '      var cls = sb.ToString();',
+      '      if ((cls == "Progman" || cls == "WorkerW") && IsWindowVisible(h) && wallIdx < 0) wallIdx = idx;',
+      '      idx++; return true;',
+      '    }, IntPtr.Zero);',
+      '    return "petIdx=" + petIdx + " wallIdx=" + wallIdx + " above=" + (petIdx >= 0 && (wallIdx < 0 || petIdx < wallIdx));',
+      '  }',
+      '}',
+      "'@",
+      '$null = Add-Type -TypeDefinition $sig',
+      '$pet=[IntPtr]::new([Int64]' + pPetHwnd + ')',
+      '[Probe]::Run($pet)',
+    ].join('\n');
+    const probeOut = await new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', probe], { windowsHide: true, timeout: 15000 }, (err, stdout) => resolve(String(stdout || '').trim()));
+    });
+    report('pet-above-wallpaper', /above=True/i.test(probeOut), probeOut || 'no-output');
+    await setTopmostFromMain(true);
+    await delay(400);
+
+    // 6. 网站列表归一化（校验/防注入逻辑）：非法 url 会被过滤，空列表回退到默认站点（全部 http/https）
+    const sitesOut = normalizeSites(config.sites);
+    const badSites = normalizeSites({ frequent: [{ name: 'X', url: 'javascript:alert(1)' }], more: [] });
+    const badClean = JSON.stringify(badSites).indexOf('javascript:') === -1 &&
+      badSites.frequent.every((s) => /^https?:\/\//i.test(s.url));
+    report('sites-normalize', sitesOut.frequent.length > 0 && badClean,
+      'frequent=' + sitesOut.frequent.length + ' more=' + sitesOut.more.length + ' badFallback=' + badSites.frequent.length);
+
+    // 7. 截图（衬棋盘格背景便于观察透明渲染），供人工/视觉核查
+    await win.webContents.executeJavaScript(
+      'document.body.style.background = "repeating-conic-gradient(#dde3ec 0% 25%, #c3cddc 0% 50%) 0 0 / 24px 24px"; true'
+    );
+    await delay(400);
+    const shot = await win.webContents.capturePage();
+    const shotPath = path.join(__dirname, 'selftest.png');
+    fs.writeFileSync(shotPath, shot.toPNG());
+    await win.webContents.executeJavaScript('document.body.style.background = "transparent"; true');
+    report('screenshot', fs.existsSync(shotPath) && fs.statSync(shotPath).size > 1000, shotPath + ' (' + fs.statSync(shotPath).size + 'B)');
+
+    // 8. 隐藏/唤回往返：隐藏后窗口不可见，showPet 唤回后可见
+    hidePet();
+    await delay(500);
+    const hiddenOk = !win.isVisible();
+    showPet();
+    await delay(500);
+    const shownOk = win.isVisible();
+    report('hide-show-roundtrip', hiddenOk && shownOk, 'hidden=' + hiddenOk + ' shown=' + shownOk);
+  } catch (e) {
+    report('selftest-exception', false, (e && e.stack) || String(e));
+  }
+
+  // 收尾：恢复皮肤/窗口位置/置顶，写出结果，退出
+  try {
+    config.skin = originalSkin || config.skin;
+    saveConfig(config);
+    if (win) {
+      win.setPosition(originalPos[0], originalPos[1]);
+      await setTopmostFromMain(true); // 原生恢复到最上（app.exit 不触发 will-quit）
+    }
+  } catch (_) {}
+  killTopmostWatcher();
+  clearTimeout(watchdog);
+  const failed = results.filter((r) => !r.ok).length;
+  log('[selftest] 完成：共 ' + results.length + ' 项，失败 ' + failed + ' 项');
+  setTimeout(() => { isQuitting = true; app.exit(failed > 0 ? 2 : 0); }, 600);
 }

@@ -4,7 +4,8 @@
   "description": "可爱的 DeepSeek 桌宠：一键启动 DeepSeek 网页版 / dsh，还能当垃圾桶吃掉文件",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "selftest": "electron . --selftest"
   },
   "author": "",
   "license": "MIT",
