@@ -3,9 +3,11 @@ const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 // ---------- 诊断日志 ----------
 const LOG_FILE = path.join(__dirname, 'pet-log.txt');
+const INDEX_URL = pathToFileURL(path.join(__dirname, 'index.html')).href;
 const LOG_MAX_BYTES = 1024 * 1024; // 超过 1MB 自动轮转到 pet-log.old.txt，防止日志无限增长
 function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
@@ -33,6 +35,7 @@ try {
 // ---------- 配置（皮肤 / 开机自启） ----------
 const CONFIG_FILE = path.join(__dirname, 'pet-config.json');
 const SKINS_DIR = path.join(__dirname, 'skins');
+const MAX_SKIN_BYTES = 25 * 1024 * 1024;
 const AUTOSTART_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const AUTOSTART_NAME = 'DeepSeekPet';
 
@@ -117,7 +120,12 @@ function getImportedSkins() {
     for (const f of fs.readdirSync(SKINS_DIR)) {
       if (!/\.(png|jpe?g|webp|gif)$/i.test(f)) continue;
       try {
-        const buf = fs.readFileSync(path.join(SKINS_DIR, f));
+        const skinPath = path.join(SKINS_DIR, f);
+        if (fs.statSync(skinPath).size > MAX_SKIN_BYTES) {
+          log('跳过过大的皮肤: ' + f);
+          continue;
+        }
+        const buf = fs.readFileSync(skinPath);
         const ext = path.extname(f).toLowerCase();
         const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
         // 布局描述（多行动画/镜像/每套帧时长）：<皮肤名>.layout.json
@@ -168,21 +176,43 @@ function isPortListening(port, host = '127.0.0.1') {
 }
 
 async function launchDsh() {
-  // 智能启动：dsh 的网页服务如果已经在 127.0.0.1:3080 运行，就直接打开它，
-  // 否则新开一个控制台窗口运行 `dsh web`
+  // 期望行为：点「启动 dsh」→ 打开 dsh 网页。
+  // ① 网页服务已在 127.0.0.1:3080 运行 → 直接打开；
+  // ② 未运行 → 后台静默拉起 `dsh web`（隐藏窗口，不再弹黑色控制台），
+  //    轮询等端口就绪后自动打开网页；拉起失败/超时返回 failed。
   const port = 3080;
+  const url = `http://127.0.0.1:${port}/`;
   if (await isPortListening(port)) {
-    shell.openExternal(`http://127.0.0.1:${port}/`);
+    shell.openExternal(url);
     return 'opened';
   }
-  // start 的第一个参数 "" 是窗口标题占位，避免被当成命令
-  const child = spawn(
-    'cmd.exe',
-    ['/c', 'start', '', 'cmd.exe', '/k', 'dsh', 'web'],
-    { detached: true, stdio: 'ignore', windowsHide: false, shell: false }
-  );
-  child.unref();
-  return 'launched';
+  let child = null;
+  try {
+    // 用 powershell 执行（dsh 是 .ps1，cmd 直跑会失败）；windowsHide + detached + stdio ignore → 无窗口
+    child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'dsh web'], {
+      detached: true, stdio: 'ignore', windowsHide: true, shell: false,
+    });
+    child.unref();
+  } catch (e) {
+    log('启动 dsh 失败: ' + e);
+    return 'failed';
+  }
+  let exitedEarly = false;
+  try { child.on('exit', () => { exitedEarly = true; }); } catch (_) {}
+  // 轮询等端口就绪（最多 20 秒）；子进程提前退出视为启动失败，不再干等
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (await isPortListening(port)) {
+      shell.openExternal(url);
+      return 'launched';
+    }
+    if (exitedEarly && !(await isPortListening(port))) {
+      log('dsh web 启动后立即退出，端口未就绪');
+      return 'failed';
+    }
+  }
+  log('dsh web 启动超时（20s 内端口未就绪）');
+  return 'failed';
 }
 
 function openDeepseek() {
@@ -383,6 +413,17 @@ function createWindow() {
   win.setAlwaysOnTop(true, 'floating');
   // 关闭后台节流：被菜单捕获层盖住时，宠物动画照常播放
   win.webContents.setBackgroundThrottling(false);
+  // 本窗口只承载本地 UI。若允许导航到远端页面，preload 暴露的桌宠能力会随页面保留。
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url !== INDEX_URL) {
+      event.preventDefault();
+      log('已阻止窗口导航: ' + url);
+    }
+  });
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    log('已阻止窗口打开新页面: ' + url);
+    return { action: 'deny' };
+  });
   win.loadFile('index.html');
 
   // 收集渲染进程的报错信息到日志
@@ -479,7 +520,8 @@ function sendMediaKey(vk) {
   });
 }
 
-ipcMain.handle('media-control', async (_e, action) => {
+ipcMain.handle('media-control', async (event, action) => {
+  if (!isTrustedSender(event)) return false;
   const keys = { 'play-pause': 0xB3, 'next': 0xB0, 'prev': 0xB1 };
   const vk = keys[action];
   if (!vk) return false;
@@ -525,7 +567,14 @@ function createTray() {
 }
 
 // ---------- IPC ----------
-ipcMain.on('log', (_e, msg) => log('[renderer] ' + msg));
+// 仅接受主窗口本地页面的消息。即便未来误加了第二个窗口，也不能调用桌宠的本机能力。
+function isTrustedSender(event) {
+  return !!win && event.sender === win.webContents && event.senderFrame && event.senderFrame.url === INDEX_URL;
+}
+
+ipcMain.on('log', (event, msg) => {
+  if (isTrustedSender(event)) log('[renderer] ' + String(msg).slice(0, 4000));
+});
 
 ipcMain.handle('get-pet-image', () => petImageDataUrl);
 
@@ -533,7 +582,8 @@ ipcMain.handle('get-config', () => config);
 
 ipcMain.handle('get-bounds', () => desktopBounds);
 
-ipcMain.handle('set-skin', (_e, skinId) => {
+ipcMain.handle('set-skin', (event, skinId) => {
+  if (!isTrustedSender(event)) return false;
   config.skin = String(skinId);
   saveConfig(config);
   log('皮肤切换 -> ' + config.skin);
@@ -546,7 +596,8 @@ ipcMain.handle('get-skins', () => ({
   current: config.skin || 'classic',
 }));
 
-ipcMain.handle('set-auto-start', async (_e, enable) => {
+ipcMain.handle('set-auto-start', async (event, enable) => {
+  if (!isTrustedSender(event)) return null;
   const ok = await setAutoStart(!!enable);
   if (typeof ok === 'boolean') { config.autoStart = ok; saveConfig(config); }
   if (tray) tray.setContextMenu(buildTrayMenu());
@@ -554,7 +605,8 @@ ipcMain.handle('set-auto-start', async (_e, enable) => {
   return ok;
 });
 
-ipcMain.handle('import-skin', async () => {
+ipcMain.handle('import-skin', async (event) => {
+  if (!isTrustedSender(event)) return null;
   const res = await dialog.showOpenDialog(win, {
     title: '选择立绘图片（PNG 透明图效果最佳）',
     filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
@@ -563,10 +615,21 @@ ipcMain.handle('import-skin', async () => {
   if (res.canceled || !res.filePaths || !res.filePaths.length) return null;
   const src = res.filePaths[0];
   try {
+    const sourceSize = fs.statSync(src).size;
+    if (sourceSize > MAX_SKIN_BYTES) {
+      log('导入皮肤失败：文件过大 ' + sourceSize + 'B');
+      return null;
+    }
     if (!fs.existsSync(SKINS_DIR)) fs.mkdirSync(SKINS_DIR, { recursive: true });
-    const name = path.basename(src);
-    fs.copyFileSync(src, path.join(SKINS_DIR, name));
-    const buf = fs.readFileSync(path.join(SKINS_DIR, name));
+    const parsed = path.parse(path.basename(src));
+    let name = parsed.base;
+    let serial = 2;
+    while (fs.existsSync(path.join(SKINS_DIR, name)) && path.resolve(src) !== path.resolve(path.join(SKINS_DIR, name))) {
+      name = parsed.name + ' (' + serial++ + ')' + parsed.ext;
+    }
+    const destination = path.join(SKINS_DIR, name);
+    if (path.resolve(src) !== path.resolve(destination)) fs.copyFileSync(src, destination);
+    const buf = fs.readFileSync(destination);
     const ext = path.extname(name).toLowerCase();
     const mime = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : ext === '.gif' ? 'image/gif' : 'image/jpeg';
     const skin = { id: 'imported:' + name, name: name.replace(/\.[^.]+$/, ''), dataUrl: 'data:' + mime + ';base64,' + buf.toString('base64') };
@@ -583,10 +646,15 @@ ipcMain.handle('import-skin', async () => {
   }
 });
 
-ipcMain.handle('open-deepseek', () => { openDeepseek(); return true; });
+ipcMain.handle('open-deepseek', (event) => {
+  if (!isTrustedSender(event)) return false;
+  openDeepseek();
+  return true;
+});
 
 // 打开任意网页（右键菜单快捷入口），只放行 http/https
-ipcMain.handle('open-web', (_e, url) => {
+ipcMain.handle('open-web', (event, url) => {
+  if (!isTrustedSender(event)) return false;
   const u = String(url || '').trim();
   if (!/^https?:\/\//i.test(u)) return false;
   try { shell.openExternal(u); return true; } catch (e) { log('打开网页失败: ' + u + ' -> ' + e); return false; }
@@ -595,21 +663,25 @@ ipcMain.handle('open-web', (_e, url) => {
 // 网站列表读写（一级常用 / 二级更多）
 ipcMain.handle('get-sites', () => config.sites);
 
-ipcMain.handle('set-sites', (_e, sites) => {
+ipcMain.handle('set-sites', (event, sites) => {
+  if (!isTrustedSender(event)) return config.sites;
   config.sites = normalizeSites(sites);
   saveConfig(config);
   log('网站列表已更新: frequent=' + config.sites.frequent.length + ' more=' + config.sites.more.length);
   return config.sites;
 });
 
-ipcMain.handle('launch-dsh', async () => launchDsh());
+ipcMain.handle('launch-dsh', async (event) => isTrustedSender(event) ? launchDsh() : false);
 
-ipcMain.handle('trash-items', async (_e, paths) => {
+ipcMain.handle('trash-items', async (event, paths) => {
+  if (!isTrustedSender(event) || !Array.isArray(paths)) return [];
   const results = [];
-  for (const p of paths || []) {
+  for (const p of paths.slice(0, 100)) {
     try {
-      await shell.trashItem(p);
-      results.push({ ok: true, path: p });
+      const itemPath = path.resolve(String(p));
+      if (!path.isAbsolute(String(p)) || !fs.existsSync(itemPath)) throw new Error('无效的文件路径');
+      await shell.trashItem(itemPath);
+      results.push({ ok: true, path: itemPath });
     } catch (err) {
       results.push({ ok: false, path: p, error: String((err && err.message) || err) });
     }
@@ -621,7 +693,8 @@ ipcMain.handle('trash-items', async (_e, paths) => {
 // client 坐标是 CSS 像素（DIP），与 getPosition 同一坐标系，彻底避免 DPI 漂移
 let dragMoveCount = 0;
 let dragPausedWatcher = false; // 拖动期间是否暂停了置顶守护
-ipcMain.on('drag-start', () => {
+ipcMain.on('drag-start', (event) => {
+  if (!isTrustedSender(event)) return;
   if (!win) return;
   // 拖动前先把窗口尺寸钉回标准值（防御：某种原因曾把它放大）
   const [w, h] = win.getSize();
@@ -641,16 +714,10 @@ ipcMain.on('drag-start', () => {
   }
 });
 
-ipcMain.on('drag-move', (_e, p) => {
+ipcMain.on('drag-move', (event, p) => {
+  if (!isTrustedSender(event)) return;
   if (!win || !drag || !p || p.dx == null || p.dy == null) return;
-  // 拖动边界按“身体可见范围”计算：窗口有透明空边（上约60px、下约44px），
-  // 允许窗口略微越出屏幕，让宠物身体能真正贴到屏幕最顶端/最底端
-  const ny = clampNum(
-    Math.round(drag.wy + p.dy),
-    desktopBounds.y - 60,
-    Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44)
-  );
-  const nx = clampNum(Math.round(drag.wx + p.dx), desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
+  const { x: nx, y: ny } = clampPetPosition(Math.round(drag.wx + p.dx), Math.round(drag.wy + p.dy));
   // setBounds 同时锁定位置与尺寸：无论什么原因导致的窗口变大都会被立即纠正
   win.setBounds({ x: nx, y: ny, width: PET_W, height: PET_H });
   if (++dragMoveCount % 15 === 0) {
@@ -658,7 +725,8 @@ ipcMain.on('drag-move', (_e, p) => {
   }
 });
 
-ipcMain.on('drag-end', () => {
+ipcMain.on('drag-end', (event) => {
+  if (!isTrustedSender(event)) return;
   drag = null;
   // 拖动结束：若之前暂停了守护且置顶仍为关，恢复守护把宠物贴回桌面层
   if (dragPausedWatcher) {
@@ -671,7 +739,8 @@ ipcMain.on('drag-end', () => {
 // 没有全屏覆盖窗口，浏览器永远不会被遮挡，网页视频不会暂停
 let menuOpenInMain = false;
 
-ipcMain.on('menu-opened', () => {
+ipcMain.on('menu-opened', (event) => {
+  if (!isTrustedSender(event)) return;
   menuOpenInMain = true;
   if (!win) return;
   win.setFocusable(true);  // 临时可聚焦，让“点外面”能触发失焦
@@ -679,7 +748,8 @@ ipcMain.on('menu-opened', () => {
   log('菜单打开（窗口已临时可聚焦）');
 });
 
-ipcMain.on('menu-closed', () => {
+ipcMain.on('menu-closed', (event) => {
+  if (!isTrustedSender(event)) return;
   if (menuOpenInMain) log('菜单关闭');
   menuOpenInMain = false;
   if (win) win.setFocusable(false); // 恢复“永不抢焦点”
@@ -696,7 +766,8 @@ function onMenuWindowBlur() {
 }
 
 // 打开剪贴板路径：文件夹直接打开，文件在资源管理器中定位，网址用浏览器打开
-ipcMain.handle('open-clipboard-path', async () => {
+ipcMain.handle('open-clipboard-path', async (event) => {
+  if (!isTrustedSender(event)) return 'invalid';
   const text = (clipboard.readText() || '').trim();
   if (!text) return 'empty';
   let p = text.replace(/^["']|["']$/g, '');
@@ -719,7 +790,8 @@ ipcMain.handle('open-clipboard-path', async () => {
 });
 
 // 鼠标穿透：透明区域点击直达桌面，只有宠物身体/面板可点（forward 保持 mousemove 可达，以便恢复）
-ipcMain.on('set-mouse-ignore', (_e, flag) => {
+ipcMain.on('set-mouse-ignore', (event, flag) => {
+  if (!isTrustedSender(event)) return;
   if (win) win.setIgnoreMouseEvents(!!flag, { forward: true });
 });
 
@@ -756,7 +828,8 @@ function setTopmostFromMain(enable) {
   return run;
 }
 
-ipcMain.handle('set-topmost', async (_e, flag) => {
+ipcMain.handle('set-topmost', async (event, flag) => {
+  if (!isTrustedSender(event)) return false;
   await setTopmostFromMain(!!flag);
   // 返回主进程镜像状态而非 win.isAlwaysOnTop()：
   // Electron #45024 下 focusable:false 窗口的内部标志可能滞后于真实层级，导致 UI 状态与实际不符
@@ -765,12 +838,30 @@ ipcMain.handle('set-topmost', async (_e, flag) => {
 
 ipcMain.handle('get-topmost', () => topmostOn);
 
-ipcMain.on('quit', () => { isQuitting = true; app.quit(); });
+ipcMain.on('quit', (event) => {
+  if (!isTrustedSender(event)) return;
+  isQuitting = true;
+  app.quit();
+});
 
 // ---------- App lifecycle ----------
 // 单实例锁：避免重复启动产生多只宠物互相干扰（拖动错乱、日志串扰）
 const clampNum = (v, a, b) => Math.max(a, Math.min(b, v));
 let desktopBounds = { x: 0, y: 0, right: 1920, bottom: 1080 };      // 工作区（不含任务栏）
+
+// 不把多显示器当成一个大矩形：错位屏幕之间可能是不可见的空洞。
+function clampPetPosition(x, y) {
+  let area;
+  try {
+    area = screen.getDisplayNearestPoint({ x: x + Math.floor(PET_W / 2), y: y + Math.floor(PET_H / 2) }).workArea;
+  } catch (_) {
+    area = { x: desktopBounds.x, y: desktopBounds.y, width: desktopBounds.right - desktopBounds.x, height: desktopBounds.bottom - desktopBounds.y };
+  }
+  return {
+    x: clampNum(x, area.x, Math.max(area.x, area.x + area.width - PET_W)),
+    y: clampNum(y, area.y - 60, Math.max(area.y - 60, area.y + area.height - PET_H + 44)),
+  };
+}
 
 function computeDesktopBounds() {
   try {
@@ -901,8 +992,7 @@ async function runSelfTest() {
     await win.webContents.executeJavaScript('petAPI.dragStart(); petAPI.dragMove(40, 30); petAPI.dragEnd(); true');
     await delay(300);
     const [wx1, wy1] = win.getPosition();
-    const expX = clampNum(wx0 + 40, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
-    const expY = clampNum(wy0 + 30, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    const { x: expX, y: expY } = clampPetPosition(wx0 + 40, wy0 + 30);
     report('drag-ipc', closeEnough(wx1, expX) && closeEnough(wy1, expY) && drag === null,
       'from=(' + wx0 + ',' + wy0 + ') to=(' + wx1 + ',' + wy1 + ') expect=(' + expX + ',' + expY + ') dragState=' + JSON.stringify(drag));
 
@@ -932,8 +1022,7 @@ async function runSelfTest() {
     await win.webContents.executeJavaScript('petAPI.dragStart(); petAPI.dragMove(60, 40); petAPI.dragEnd(); true');
     await delay(400);
     const [cx1, cy1] = win.getPosition();
-    const cexpX = clampNum(cx0 + 60, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
-    const cexpY = clampNum(cy0 + 40, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    const { x: cexpX, y: cexpY } = clampPetPosition(cx0 + 60, cy0 + 40);
     report('drag-after-topmost-cycling', closeEnough(cx1, cexpX) && closeEnough(cy1, cexpY) && drag === null,
       'from=(' + cx0 + ',' + cy0 + ') to=(' + cx1 + ',' + cy1 + ') expect=(' + cexpX + ',' + cexpY + ') boundsBefore=' + JSON.stringify(boundsBefore) + ' dragState=' + JSON.stringify(drag));
 
@@ -946,8 +1035,7 @@ async function runSelfTest() {
     const [wx3, wy3] = win.getPosition();
     await delay(2600); // 等守护跑 2 个周期，看是否被钉回
     const [wx4, wy4] = win.getPosition();
-    const wex = clampNum(wx2 - 50, desktopBounds.x, Math.max(desktopBounds.x, desktopBounds.right - PET_W));
-    const wey = clampNum(wy2 - 35, desktopBounds.y - 60, Math.max(desktopBounds.y - 60, desktopBounds.bottom - PET_H + 44));
+    const { x: wex, y: wey } = clampPetPosition(wx2 - 50, wy2 - 35);
     report('drag-while-watcher-running', closeEnough(wx3, wex) && closeEnough(wy3, wey) && closeEnough(wx4, wx3) && closeEnough(wy4, wy3),
       'from=(' + wx2 + ',' + wy2 + ') after=(' + wx3 + ',' + wy3 + ') after2s=(' + wx4 + ',' + wy4 + ') expect=(' + wex + ',' + wey + ')');
     await setTopmostFromMain(true);

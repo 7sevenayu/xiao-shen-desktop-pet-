@@ -864,11 +864,14 @@ async function openDeepseek() {
 
 async function launchDsh() {
   spawnSparkles(8);
+  showBubble('这就带你去 dsh~ 🤖', 1800);
   const status = await petAPI.launchDsh();
   if (status === 'opened') {
     showBubble('dsh 已经在运行啦，带你过去~ 🤖', 2200);
+  } else if (status === 'launched') {
+    showBubble('dsh 启动成功，网页已打开~ 🚀', 2200);
   } else {
-    showBubble('启动 dsh 中~ 🤖', 1800);
+    showBubble('dsh 启动失败，请检查 dsh 是否可用 😢', 2600);
   }
 }
 
@@ -1018,7 +1021,7 @@ function renderSitesMenu() {
     grid.innerHTML = frequent.map((s) => {
       const domain = domainOf(s.url);
       return '<button class="web-btn" data-action="open-web" data-url="' + esc(s.url) + '" data-domain="' + esc(domain) + '" title="' + esc(s.name) + '">' +
-        '<span class="web-ico-wrap"><img class="web-ico" alt="" loading="lazy" src="https://' + esc(domain) + '/favicon.ico"><span class="web-emoji">🌐</span></span>' +
+        '<span class="web-ico-wrap"><img class="web-ico" alt="" loading="lazy" src="https://' + esc(domain) + '/favicon.ico" data-domain="' + esc(domain) + '"><span class="web-emoji">🌐</span></span>' +
         '<span class="web-name">' + esc(s.name) + '</span></button>';
     }).join('');
   } else {
@@ -1034,7 +1037,7 @@ function renderSitesMenu() {
     more.map((s) => {
       const domain = domainOf(s.url);
       return '<div class="site-more-item" data-action="open-web" data-url="' + esc(s.url) + '" title="' + esc(s.url) + '">' +
-        '<span class="web-ico-wrap"><img class="web-ico" alt="" loading="lazy" src="https://' + esc(domain) + '/favicon.ico"><span class="web-emoji">🌐</span></span>' +
+        '<span class="web-ico-wrap"><img class="web-ico" alt="" loading="lazy" src="https://' + esc(domain) + '/favicon.ico" data-domain="' + esc(domain) + '"><span class="web-emoji">🌐</span></span>' +
         '<span>' + esc(s.name) + '</span></div>';
     }).join('');
   box.querySelectorAll('.web-ico').forEach((img) => setupFavicon(img, img.dataset.domain));
