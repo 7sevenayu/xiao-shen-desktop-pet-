@@ -18,7 +18,6 @@ contextBridge.exposeInMainWorld('petAPI', {
   // 把拖入的 File 对象还原成真实磁盘路径
   getPathForFile: (file) => webUtils.getPathForFile(file),
   openDeepseek: () => ipcRenderer.invoke('open-deepseek'),
-  launchDsh: () => ipcRenderer.invoke('launch-dsh'),
   // 打开任意网页（快捷入口）
   openWeb: (url) => ipcRenderer.invoke('open-web', url),
   // 网站快捷入口列表（一级常用 / 二级更多）

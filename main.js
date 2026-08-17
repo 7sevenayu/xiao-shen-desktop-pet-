@@ -1,7 +1,6 @@
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, screen, dialog, clipboard } = require('electron');
 const { spawn, execFile } = require('child_process');
 const fs = require('fs');
-const net = require('net');
 const path = require('path');
 const { pathToFileURL } = require('url');
 
@@ -158,62 +157,6 @@ let watcherRestarts = 0; // 守护连续异常退出计数（自动重启保护�
 
 // Window-drag state (cursor-follow based, all coordinates from screen API for consistency)
 let drag = null;
-
-function isPortListening(port, host = '127.0.0.1') {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ port, host });
-    let done = false;
-    const finish = (v) => {
-      if (done) return;
-      done = true;
-      try { socket.destroy(); } catch (_) {}
-      resolve(v);
-    };
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
-    socket.setTimeout(600, () => finish(false));
-  });
-}
-
-async function launchDsh() {
-  // 期望行为：点「启动 dsh」→ 打开 dsh 网页。
-  // ① 网页服务已在 127.0.0.1:3080 运行 → 直接打开；
-  // ② 未运行 → 后台静默拉起 `dsh web`（隐藏窗口，不再弹黑色控制台），
-  //    轮询等端口就绪后自动打开网页；拉起失败/超时返回 failed。
-  const port = 3080;
-  const url = `http://127.0.0.1:${port}/`;
-  if (await isPortListening(port)) {
-    shell.openExternal(url);
-    return 'opened';
-  }
-  let child = null;
-  try {
-    // 用 powershell 执行（dsh 是 .ps1，cmd 直跑会失败）；windowsHide + detached + stdio ignore → 无窗口
-    child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'dsh web'], {
-      detached: true, stdio: 'ignore', windowsHide: true, shell: false,
-    });
-    child.unref();
-  } catch (e) {
-    log('启动 dsh 失败: ' + e);
-    return 'failed';
-  }
-  let exitedEarly = false;
-  try { child.on('exit', () => { exitedEarly = true; }); } catch (_) {}
-  // 轮询等端口就绪（最多 20 秒）；子进程提前退出视为启动失败，不再干等
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 500));
-    if (await isPortListening(port)) {
-      shell.openExternal(url);
-      return 'launched';
-    }
-    if (exitedEarly && !(await isPortListening(port))) {
-      log('dsh web 启动后立即退出，端口未就绪');
-      return 'failed';
-    }
-  }
-  log('dsh web 启动超时（20s 内端口未就绪）');
-  return 'failed';
-}
 
 function openDeepseek() {
   shell.openExternal('https://chat.deepseek.com/');
@@ -536,7 +479,6 @@ function buildTrayMenu() {
     { label: '🙈 隐藏桌宠', click: hidePet },
     { type: 'separator' },
     { label: '🌐 打开 DeepSeek 网页版', click: () => openDeepseek() },
-    { label: '🤖 启动 dsh', click: () => { launchDsh(); } },
     { type: 'separator' },
     { label: '🎵 播放/暂停', click: () => { sendMediaKey(0xB3); } },
     { label: '⏮ 上一首', click: () => { sendMediaKey(0xB1); } },
@@ -670,8 +612,6 @@ ipcMain.handle('set-sites', (event, sites) => {
   log('网站列表已更新: frequent=' + config.sites.frequent.length + ' more=' + config.sites.more.length);
   return config.sites;
 });
-
-ipcMain.handle('launch-dsh', async (event) => isTrustedSender(event) ? launchDsh() : false);
 
 ipcMain.handle('trash-items', async (event, paths) => {
   if (!isTrustedSender(event) || !Array.isArray(paths)) return [];

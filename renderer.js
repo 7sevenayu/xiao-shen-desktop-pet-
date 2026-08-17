@@ -862,19 +862,6 @@ async function openDeepseek() {
   await petAPI.openDeepseek();
 }
 
-async function launchDsh() {
-  spawnSparkles(8);
-  showBubble('这就带你去 dsh~ 🤖', 1800);
-  const status = await petAPI.launchDsh();
-  if (status === 'opened') {
-    showBubble('dsh 已经在运行啦，带你过去~ 🤖', 2200);
-  } else if (status === 'launched') {
-    showBubble('dsh 启动成功，网页已打开~ 🚀', 2200);
-  } else {
-    showBubble('dsh 启动失败，请检查 dsh 是否可用 😢', 2600);
-  }
-}
-
 // 音乐控制（媒体键模拟）：播放/暂停、上一首、下一首
 async function mediaControl(action, msg) {
   lastInteraction = performance.now();
@@ -981,7 +968,6 @@ function hidePet() {
 function runMenuAction(action) {
   switch (action) {
     case 'deepseek': openDeepseek(); break;
-    case 'dsh': launchDsh(); break;
     case 'clipboard': openClipboardPath(); break;
     case 'media-play-pause': mediaControl('play-pause', '⏯ 已发送（先播放音乐才能控制哦）'); break;
     case 'media-prev': mediaControl('prev', '⏮ 已发送上一首'); break;
@@ -1321,7 +1307,6 @@ const tips = [
   '把文件拖到我身上，我帮你丢进回收站~ 🗑️',
   '右键我可以看到功能菜单~',
   '我是小深，你的专属桌宠~ 💙',
-  '需要启动 dsh？右键菜单里有哦~',
 ];
 function scheduleTip() {
   setTimeout(() => {
